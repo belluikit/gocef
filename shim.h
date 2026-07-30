@@ -176,6 +176,16 @@ extern void gocefOnCursorChange(uint64_t handle, int cursorType);
 // requires a non-empty rectangle, so the Go side must always answer.
 extern void gocefGetViewRect(uint64_t handle, int *w, int *h);
 
+// gocefGetScreenScale asks the host for the display's device scale factor — the
+// ratio between physical and logical pixels.
+//
+// This is what makes a HiDPI display render sharply. CEF's compositor decides
+// the raster resolution from it, so a host that never supplies it gets content
+// rasterised at 1x and then scaled up: soft text and blurred hairlines that
+// nothing downstream can repair. It is pulled per call rather than captured
+// once because a window can move between monitors of different scales.
+extern float gocefGetScreenScale(uint64_t handle);
+
 // gocefOnAfterCreated and gocefOnBeforeClose bracket the browser's life.
 extern void gocefOnAfterCreated(uint64_t handle);
 extern void gocefOnBeforeClose(uint64_t handle);

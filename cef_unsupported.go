@@ -44,6 +44,7 @@ type AcceleratedFrame struct {
 // Handler receives everything a windowless browser reports.
 type Handler interface {
 	ViewSize() (w, h int)
+	ScreenScale() float32
 	Paint(buf []byte, w, h int, popup bool)
 	AcceleratedPaint(f AcceleratedFrame)
 	PopupShow(show bool)
@@ -55,6 +56,10 @@ type Handler interface {
 
 // NopHandler implements Handler with do-nothing methods, apart from ViewSize.
 type NopHandler struct{}
+
+// ScreenScale defaults to an unscaled display. Unlike ViewSize there is a safe
+// default here, so NopHandler can supply it.
+func (NopHandler) ScreenScale() float32 { return 1 }
 
 func (NopHandler) Paint([]byte, int, int, bool)      {}
 func (NopHandler) AcceleratedPaint(AcceleratedFrame) {}

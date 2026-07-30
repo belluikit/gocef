@@ -98,6 +98,20 @@ like a GPU fault or a CEF bug and is neither.
   visibility CEF can observe, so drive `SetVisible` from show/hide and from
   scrolling out of a clipping ancestor.
 
+## HiDPI
+
+`Handler.ScreenScale` is not optional detail. CEF's compositor decides its raster
+resolution from the device scale factor, so a host that answers 1 on a scaled
+display gets content rasterised at 1x and then scaled up — soft text, blurred
+hairlines — and nothing downstream can repair it, because the pixels were never
+drawn. It is asked per call rather than captured once, since a window can move
+between monitors of different scales.
+
+The screen rectangles are deliberately left equal to the view: CEF falls back to
+`get_view_rect` when they are absent, which is right for an embedded view that
+has no monitor of its own. They only affect where popups are placed, and a popup
+belongs inside the view here.
+
 ## Frames
 
 `Handler.Paint` delivers BGRA with an upper-left origin, valid only for the

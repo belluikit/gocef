@@ -25,6 +25,18 @@ type Handler interface {
 	// non-empty rectangle, so it must always answer.
 	ViewSize() (w, h int)
 
+	// ScreenScale is asked for the display's device scale factor — the ratio
+	// between physical and logical pixels. 1 for a conventional display, 2 for
+	// a typical HiDPI one, and fractional values are normal on Linux.
+	//
+	// CEF's compositor decides its raster resolution from this, so a host that
+	// answers 1 on a scaled display gets content rasterised at 1x and scaled
+	// up: soft text and blurred hairlines that nothing downstream can repair.
+	//
+	// It is asked per call rather than captured once, because a window can move
+	// between monitors of different scales.
+	ScreenScale() float32
+
 	// Paint delivers a CPU frame: BGRA, upper-left origin. The buffer is valid
 	// only for the duration of the call — copy what you keep.
 	//
@@ -66,6 +78,10 @@ type AcceleratedFrame struct {
 // NopHandler implements Handler with do-nothing methods, apart from ViewSize,
 // which must be supplied — there is no safe default for it.
 type NopHandler struct{}
+
+// ScreenScale defaults to an unscaled display. Unlike ViewSize there is a safe
+// default here, so NopHandler can supply it.
+func (NopHandler) ScreenScale() float32 { return 1 }
 
 func (NopHandler) Paint([]byte, int, int, bool)      {}
 func (NopHandler) AcceleratedPaint(AcceleratedFrame) {}
@@ -183,6 +199,21 @@ func gocefGetViewRect(handle C.uint64_t, w, h *C.int) {
 	bw, bh := b.handler.ViewSize()
 	*w = C.int(bw)
 	*h = C.int(bh)
+}
+
+//export gocefGetScreenScale
+func gocefGetScreenScale(handle C.uint64_t) C.float {
+	b := lookup(handle)
+	if b == nil {
+		return 1
+	}
+	s := b.handler.ScreenScale()
+	if s <= 0 {
+		// CEF divides by this; a zero would be a compositor fault reported far
+		// from the handler that produced it.
+		return 1
+	}
+	return C.float(s)
 }
 
 //export gocefOnPaint

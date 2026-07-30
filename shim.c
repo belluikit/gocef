@@ -185,6 +185,32 @@ static void CEF_CALLBACK rh_get_view_rect(struct _cef_render_handler_t *self,
   rect->height = h > 0 ? h : 1;
 }
 
+static int CEF_CALLBACK rh_get_screen_info(struct _cef_render_handler_t *self,
+                                           struct _cef_browser_t *browser,
+                                           cef_screen_info_t *info) {
+  (void)browser;
+  ctx_t *c = CTX_OF(render, self);
+
+  info->device_scale_factor = gocefGetScreenScale(c->handle);
+  info->depth = 32;
+  info->depth_per_component = 8;
+  info->is_monochrome = 0;
+
+  // Left as the view rectangle: CEF documents that a NULL screen rectangle
+  // falls back to get_view_rect, which is right for an embedded view that has
+  // no monitor of its own. The rectangles only matter for placing popups, and
+  // a popup belongs inside the view here rather than inside a display.
+  int w = 0, h = 0;
+  gocefGetViewRect(c->handle, &w, &h);
+  info->rect.x = 0;
+  info->rect.y = 0;
+  info->rect.width = w > 0 ? w : 1;
+  info->rect.height = h > 0 ? h : 1;
+  info->available_rect = info->rect;
+
+  return 1; // the structure was filled in
+}
+
 static void CEF_CALLBACK rh_on_paint(struct _cef_render_handler_t *self,
                                      struct _cef_browser_t *browser,
                                      cef_paint_element_type_t type,
@@ -451,6 +477,7 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
   init_base(&c->render.base, sizeof(c->render), render_add_ref, render_release,
             render_has_one, render_has_any);
   c->render.get_view_rect = rh_get_view_rect;
+  c->render.get_screen_info = rh_get_screen_info;
   c->render.on_paint = rh_on_paint;
   c->render.on_accelerated_paint = rh_on_accelerated_paint;
   c->render.on_popup_show = rh_on_popup_show;
