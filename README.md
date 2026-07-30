@@ -128,12 +128,20 @@ the callback (belluikit/bellui#113).
 
 The design is proven end to end by bellui's `hack/cefprobe`, which is where every
 trap above was found. This package is the extraction of that probe into a
-reusable binding, and **its Linux build has not yet been exercised against real
-hardware** — the portable (stub) build is verified, and CI compiles the Linux
-half. Runtime verification is tracked on belluikit/bellui#103.
+reusable binding.
 
-Input forwarding, navigation beyond `LoadURL`, and the DevTools-protocol bridge
-are not implemented yet; they are the next slice of the same issue.
+Implemented: the runtime loader and version handshake, windowless browser
+lifecycle, resize, visibility, focus, the render callbacks (paint, accelerated
+paint, popup surface, cursor), HiDPI scale, mouse and keyboard input,
+navigation, and the DevTools bridge.
+
+Not implemented: IME composition and touch (belluikit/bellui#121), and
+`external_message_pump` (belluikit/bellui#120).
+
+**Nothing here has run.** The portable build is verified and CI compiles the
+Linux half, but no part of this has been exercised against a real CEF payload —
+including the 13300 API pin, which is reasoned from a survey of version guards
+where the probe only ever proved 15101. That is belluikit/bellui#117.
 
 ## Licence
 
