@@ -104,6 +104,51 @@ void gocef_invalidate(uint64_t handle);
 // gocef_load_url navigates the main frame.
 void gocef_load_url(uint64_t handle, const char *url);
 
+// Navigation operations, for gocef_nav. Queries report their answer; commands
+// report 1 if they were dispatched.
+enum {
+  GOCEF_NAV_CAN_GO_BACK = 0,
+  GOCEF_NAV_GO_BACK,
+  GOCEF_NAV_CAN_GO_FORWARD,
+  GOCEF_NAV_GO_FORWARD,
+  GOCEF_NAV_RELOAD,
+  GOCEF_NAV_RELOAD_NO_CACHE,
+  GOCEF_NAV_STOP,
+};
+
+int gocef_nav(uint64_t handle, int op);
+
+// ---------------------------------------------------------------------------
+// Input. Coordinates are relative to the view's upper-left corner, in pixels.
+
+void gocef_send_mouse_move(uint64_t handle, int x, int y, uint32_t modifiers,
+                           int leave);
+void gocef_send_mouse_click(uint64_t handle, int x, int y, uint32_t modifiers,
+                            int button, int mouseUp, int clickCount);
+void gocef_send_mouse_wheel(uint64_t handle, int x, int y, uint32_t modifiers,
+                            int deltaX, int deltaY);
+
+// gocef_send_key sends one key event. keyType is a cef_key_event_type_t
+// (0 = raw key down, 1 = key down, 2 = key up, 3 = char).
+void gocef_send_key(uint64_t handle, int keyType, uint32_t modifiers,
+                    int windowsKeyCode, int nativeKeyCode, uint16_t character,
+                    uint16_t unmodifiedCharacter, int isSystemKey);
+
+// ---------------------------------------------------------------------------
+// DevTools protocol.
+//
+// This is the whole bridge surface: raw UTF-8 JSON in and out. CEF's other
+// entry point, execute_dev_tools_method, takes a cef_dictionary_value_t, which
+// would mean building a CEF value tree from Go for no gain — the protocol is
+// JSON at both ends anyway.
+
+// gocef_send_devtools sends one protocol message. Returns 0 on failure.
+int gocef_send_devtools(uint64_t handle, const void *msg, size_t n);
+
+// gocefOnDevToolsMessage delivers a protocol message: a result for one of our
+// calls, or an event. The buffer is valid only for the duration of the call.
+extern void gocefOnDevToolsMessage(uint64_t handle, void *msg, int n);
+
 // ---------------------------------------------------------------------------
 // Callbacks into Go. All are called on CEF's browser UI thread, which is the
 // thread that pumps the loop.

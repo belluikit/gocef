@@ -252,3 +252,121 @@ func gocefOnBeforeClose(handle C.uint64_t) {
 	delete(browsers, uint64(handle))
 	mu.Unlock()
 }
+
+// MouseButton identifies a button for SendMouseClick, matching
+// cef_mouse_button_type_t.
+type MouseButton int
+
+const (
+	MouseLeft MouseButton = iota
+	MouseMiddle
+	MouseRight
+)
+
+// KeyEventType identifies a key event, matching cef_key_event_type_t.
+//
+// A typed character normally needs two events: a KeyDown carrying the key code,
+// then a KeyChar carrying the rune. Sending only one of them is the usual reason
+// a page sees modifiers but no text, or text with no keydown handler firing.
+type KeyEventType int
+
+const (
+	KeyRawDown KeyEventType = iota
+	KeyDown
+	KeyUp
+	KeyChar
+)
+
+// SendMouseMove sends a pointer move. leave reports the pointer leaving the
+// view, which is what lets a page clear its hover state.
+func (b *Browser) SendMouseMove(x, y int, modifiers uint32, leave bool) {
+	C.gocef_send_mouse_move(C.uint64_t(b.id), C.int(x), C.int(y),
+		C.uint32_t(modifiers), cbool(leave))
+}
+
+// SendMouseClick sends a press or release. clickCount carries double- and
+// triple-click, which is how a page distinguishes word and line selection.
+func (b *Browser) SendMouseClick(x, y int, modifiers uint32, button MouseButton, up bool, clickCount int) {
+	C.gocef_send_mouse_click(C.uint64_t(b.id), C.int(x), C.int(y),
+		C.uint32_t(modifiers), C.int(button), cbool(up), C.int(clickCount))
+}
+
+// SendMouseWheel scrolls at a point. Deltas are in pixels.
+func (b *Browser) SendMouseWheel(x, y int, modifiers uint32, deltaX, deltaY int) {
+	C.gocef_send_mouse_wheel(C.uint64_t(b.id), C.int(x), C.int(y),
+		C.uint32_t(modifiers), C.int(deltaX), C.int(deltaY))
+}
+
+// SendKey sends one key event. See KeyEventType for why text usually needs two.
+func (b *Browser) SendKey(t KeyEventType, modifiers uint32, windowsKeyCode, nativeKeyCode int, char, unmodifiedChar uint16, systemKey bool) {
+	C.gocef_send_key(C.uint64_t(b.id), C.int(t), C.uint32_t(modifiers),
+		C.int(windowsKeyCode), C.int(nativeKeyCode), C.uint16_t(char),
+		C.uint16_t(unmodifiedChar), cbool(systemKey))
+}
+
+// CanGoBack reports whether there is history to go back to.
+func (b *Browser) CanGoBack() bool {
+	return C.gocef_nav(C.uint64_t(b.id), C.GOCEF_NAV_CAN_GO_BACK) != 0
+}
+
+// CanGoForward reports whether there is history to go forward to.
+func (b *Browser) CanGoForward() bool {
+	return C.gocef_nav(C.uint64_t(b.id), C.GOCEF_NAV_CAN_GO_FORWARD) != 0
+}
+
+// GoBack navigates back.
+func (b *Browser) GoBack() { C.gocef_nav(C.uint64_t(b.id), C.GOCEF_NAV_GO_BACK) }
+
+// GoForward navigates forward.
+func (b *Browser) GoForward() { C.gocef_nav(C.uint64_t(b.id), C.GOCEF_NAV_GO_FORWARD) }
+
+// Reload reloads the page. ignoreCache bypasses the HTTP cache.
+func (b *Browser) Reload(ignoreCache bool) {
+	op := C.int(C.GOCEF_NAV_RELOAD)
+	if ignoreCache {
+		op = C.GOCEF_NAV_RELOAD_NO_CACHE
+	}
+	C.gocef_nav(C.uint64_t(b.id), op)
+}
+
+// StopLoad stops the current navigation.
+func (b *Browser) StopLoad() { C.gocef_nav(C.uint64_t(b.id), C.GOCEF_NAV_STOP) }
+
+// SendDevTools sends one DevTools-protocol message — raw JSON, exactly as the
+// protocol defines it — and reports whether CEF accepted it.
+//
+// This is the whole bridge surface. Script injection, a page-to-host message
+// channel and eval-with-result are all reachable from here
+// (Page.addScriptToEvaluateOnNewDocument, Runtime.addBinding,
+// Runtime.evaluate), from the browser process, with no renderer-side code —
+// which is why bellui's backend can use it instead of a CefV8Handler.
+//
+// Replies and events arrive on DevToolsHandler.DevToolsMessage.
+func (b *Browser) SendDevTools(msg []byte) bool {
+	if len(msg) == 0 {
+		return false
+	}
+	return C.gocef_send_devtools(C.uint64_t(b.id), unsafe.Pointer(&msg[0]), C.size_t(len(msg))) != 0
+}
+
+// DevToolsHandler is an optional capability on a Handler: implement it to
+// receive DevTools-protocol traffic. A Handler that does not simply never sees
+// it, and no observer is registered for it.
+type DevToolsHandler interface {
+	// DevToolsMessage delivers raw protocol JSON — a reply to a SendDevTools
+	// call, or an event. The buffer is valid only for the duration of the call.
+	DevToolsMessage(msg []byte)
+}
+
+//export gocefOnDevToolsMessage
+func gocefOnDevToolsMessage(handle C.uint64_t, msg unsafe.Pointer, n C.int) {
+	b := lookup(handle)
+	if b == nil {
+		return
+	}
+	h, ok := b.handler.(DevToolsHandler)
+	if !ok {
+		return
+	}
+	h.DevToolsMessage(unsafe.Slice((*byte)(msg), int(n)))
+}

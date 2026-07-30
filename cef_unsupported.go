@@ -97,3 +97,40 @@ func (b *Browser) SetFocus(bool)   {}
 func (b *Browser) Invalidate()     {}
 func (b *Browser) LoadURL(string)  {}
 func (b *Browser) Close()          {}
+
+// MouseButton identifies a button for SendMouseClick.
+type MouseButton int
+
+const (
+	MouseLeft MouseButton = iota
+	MouseMiddle
+	MouseRight
+)
+
+// KeyEventType identifies a key event.
+type KeyEventType int
+
+const (
+	KeyRawDown KeyEventType = iota
+	KeyDown
+	KeyUp
+	KeyChar
+)
+
+// DevToolsHandler is an optional capability on a Handler: implement it to
+// receive DevTools-protocol traffic.
+type DevToolsHandler interface {
+	DevToolsMessage(msg []byte)
+}
+
+func (b *Browser) SendMouseMove(int, int, uint32, bool)                         {}
+func (b *Browser) SendMouseClick(int, int, uint32, MouseButton, bool, int)      {}
+func (b *Browser) SendMouseWheel(int, int, uint32, int, int)                    {}
+func (b *Browser) SendKey(KeyEventType, uint32, int, int, uint16, uint16, bool) {}
+func (b *Browser) CanGoBack() bool                                              { return false }
+func (b *Browser) CanGoForward() bool                                           { return false }
+func (b *Browser) GoBack()                                                      {}
+func (b *Browser) GoForward()                                                   {}
+func (b *Browser) Reload(bool)                                                  {}
+func (b *Browser) StopLoad()                                                    {}
+func (b *Browser) SendDevTools([]byte) bool                                     { return false }

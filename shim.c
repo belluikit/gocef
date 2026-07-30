@@ -19,6 +19,7 @@
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
+#include "include/capi/cef_devtools_message_observer_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
 #include "include/capi/cef_life_span_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
@@ -84,10 +85,16 @@ typedef struct {
   cef_render_handler_t render;
   cef_life_span_handler_t life;
   cef_display_handler_t display;
+  cef_dev_tools_message_observer_t devtools;
 
   atomic_int refs;
   uint64_t handle;
   cef_browser_t *browser;
+
+  // Holding this registration is what keeps the observer subscribed: releasing
+  // it unsubscribes, so it is kept for the browser's life rather than dropped
+  // at the end of the call that created it.
+  cef_registration_t *devtools_reg;
 } ctx_t;
 
 static ctx_t *g_ctx[MAX_BROWSERS];
@@ -144,6 +151,7 @@ REFCOUNT_IMPL(client, client)
 REFCOUNT_IMPL(render, render)
 REFCOUNT_IMPL(life, life)
 REFCOUNT_IMPL(display, display)
+REFCOUNT_IMPL(devtools, devtools)
 
 // init_base sets the size field CEF reads to tell API versions apart. Getting
 // it wrong truncates the struct silently, so it is always sizeof the real one.
@@ -251,6 +259,15 @@ static void CEF_CALLBACK ls_on_after_created(struct _cef_life_span_handler_t *se
   ctx_t *c = CTX_OF(life, self);
   browser->base.add_ref(&browser->base);
   c->browser = browser;
+
+  // The observer can only be registered once there is a host, which is why this
+  // happens here rather than at creation.
+  cef_browser_host_t *host = browser->get_host(browser);
+  if (host != NULL) {
+    c->devtools_reg = host->add_dev_tools_message_observer(host, &c->devtools);
+    host->base.release(&host->base);
+  }
+
   gocefOnAfterCreated(c->handle);
 }
 
@@ -258,11 +275,32 @@ static void CEF_CALLBACK ls_on_before_close(struct _cef_life_span_handler_t *sel
                                             struct _cef_browser_t *browser) {
   (void)browser;
   ctx_t *c = CTX_OF(life, self);
+  if (c->devtools_reg != NULL) {
+    c->devtools_reg->base.release(&c->devtools_reg->base);
+    c->devtools_reg = NULL;
+  }
   if (c->browser != NULL) {
     c->browser->base.release(&c->browser->base);
     c->browser = NULL;
   }
   gocefOnBeforeClose(c->handle);
+}
+
+// ---------------------------------------------------------------------------
+// cef_dev_tools_message_observer_t
+//
+// The whole bridge rides on this one callback plus send_dev_tools_message:
+// UTF-8 JSON in, UTF-8 JSON out. Returning 1 would consume the message and stop
+// CEF delivering it to the more specific callbacks below it; 0 leaves normal
+// delivery alone, which is what a passive observer wants.
+
+static int CEF_CALLBACK dt_on_message(struct _cef_dev_tools_message_observer_t *self,
+                                      struct _cef_browser_t *browser,
+                                      const void *message, size_t message_size) {
+  (void)browser;
+  gocefOnDevToolsMessage(CTX_OF(devtools, self)->handle, (void *)message,
+                         (int)message_size);
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +465,10 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
             display_release, display_has_one, display_has_any);
   c->display.on_cursor_change = dh_on_cursor_change;
 
+  init_base(&c->devtools.base, sizeof(c->devtools), devtools_add_ref,
+            devtools_release, devtools_has_one, devtools_has_any);
+  c->devtools.on_dev_tools_message = dt_on_message;
+
   g_ctx[slot] = c;
 
   cef_window_info_t wi;
@@ -527,4 +569,118 @@ void gocef_load_url(uint64_t handle, const char *url) {
   setstr(&curl, url);
   frame->load_url(frame, &curl);
   frame->base.release(&frame->base);
+}
+
+// ---------------------------------------------------------------------------
+// Navigation
+
+int gocef_nav(uint64_t handle, int op) {
+  ctx_t *c = ctx_find(handle);
+  if (c == NULL || c->browser == NULL) {
+    return 0;
+  }
+  cef_browser_t *b = c->browser;
+  switch (op) {
+    case GOCEF_NAV_CAN_GO_BACK:
+      return b->can_go_back(b);
+    case GOCEF_NAV_GO_BACK:
+      b->go_back(b);
+      return 1;
+    case GOCEF_NAV_CAN_GO_FORWARD:
+      return b->can_go_forward(b);
+    case GOCEF_NAV_GO_FORWARD:
+      b->go_forward(b);
+      return 1;
+    case GOCEF_NAV_RELOAD:
+      b->reload(b);
+      return 1;
+    case GOCEF_NAV_RELOAD_NO_CACHE:
+      b->reload_ignore_cache(b);
+      return 1;
+    case GOCEF_NAV_STOP:
+      b->stop_load(b);
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input
+
+void gocef_send_mouse_move(uint64_t handle, int x, int y, uint32_t modifiers,
+                           int leave) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  cef_mouse_event_t ev;
+  ev.x = x;
+  ev.y = y;
+  ev.modifiers = modifiers;
+  host->send_mouse_move_event(host, &ev, leave);
+  host->base.release(&host->base);
+}
+
+void gocef_send_mouse_click(uint64_t handle, int x, int y, uint32_t modifiers,
+                            int button, int mouseUp, int clickCount) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  cef_mouse_event_t ev;
+  ev.x = x;
+  ev.y = y;
+  ev.modifiers = modifiers;
+  host->send_mouse_click_event(host, &ev, (cef_mouse_button_type_t)button,
+                               mouseUp, clickCount);
+  host->base.release(&host->base);
+}
+
+void gocef_send_mouse_wheel(uint64_t handle, int x, int y, uint32_t modifiers,
+                            int deltaX, int deltaY) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  cef_mouse_event_t ev;
+  ev.x = x;
+  ev.y = y;
+  ev.modifiers = modifiers;
+  host->send_mouse_wheel_event(host, &ev, deltaX, deltaY);
+  host->base.release(&host->base);
+}
+
+void gocef_send_key(uint64_t handle, int keyType, uint32_t modifiers,
+                    int windowsKeyCode, int nativeKeyCode, uint16_t character,
+                    uint16_t unmodifiedCharacter, int isSystemKey) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  cef_key_event_t ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.size = sizeof(ev);
+  ev.type = (cef_key_event_type_t)keyType;
+  ev.modifiers = modifiers;
+  ev.windows_key_code = windowsKeyCode;
+  ev.native_key_code = nativeKeyCode;
+  ev.character = (char16_t)character;
+  ev.unmodified_character = (char16_t)unmodifiedCharacter;
+  ev.is_system_key = isSystemKey;
+  host->send_key_event(host, &ev);
+  host->base.release(&host->base);
+}
+
+// ---------------------------------------------------------------------------
+// DevTools protocol
+
+int gocef_send_devtools(uint64_t handle, const void *msg, size_t n) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return 0;
+  }
+  int ok = host->send_dev_tools_message(host, msg, n);
+  host->base.release(&host->base);
+  return ok;
 }
