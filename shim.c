@@ -19,6 +19,7 @@
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
+#include "include/capi/cef_display_handler_capi.h"
 #include "include/capi/cef_life_span_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
 
@@ -67,7 +68,7 @@ static void setstr(cef_string_t *dst, const char *src) {
 // ---------------------------------------------------------------------------
 // Per-browser state.
 //
-// The three handler structs CEF needs are allocated together with the handle
+// The four handler structs CEF needs are allocated together with the handle
 // they belong to, so a callback can recover the owning context by subtracting
 // the member's offset. That is what lets one shim serve many browsers without a
 // lookup table on the C side.
@@ -82,6 +83,7 @@ typedef struct {
   cef_client_t client;
   cef_render_handler_t render;
   cef_life_span_handler_t life;
+  cef_display_handler_t display;
 
   atomic_int refs;
   uint64_t handle;
@@ -141,6 +143,7 @@ static int ctx_unref(ctx_t *c) {
 REFCOUNT_IMPL(client, client)
 REFCOUNT_IMPL(render, render)
 REFCOUNT_IMPL(life, life)
+REFCOUNT_IMPL(display, display)
 
 // init_base sets the size field CEF reads to tell API versions apart. Getting
 // it wrong truncates the struct silently, so it is always sizeof the real one.
@@ -219,15 +222,25 @@ static void CEF_CALLBACK rh_on_popup_size(struct _cef_render_handler_t *self,
                    rect->height);
 }
 
-static void CEF_CALLBACK rh_on_cursor_change(struct _cef_render_handler_t *self,
-                                             struct _cef_browser_t *browser,
-                                             cef_cursor_handle_t cursor,
-                                             cef_cursor_type_t type,
-                                             const cef_cursor_info_t *info) {
+// ---------------------------------------------------------------------------
+// cef_display_handler_t
+//
+// The cursor lives here, not on the render handler where an offscreen
+// integration might expect it — a distinction the compiler is unusually clear
+// about, since the member simply does not exist on cef_render_handler_t.
+
+static int CEF_CALLBACK dh_on_cursor_change(struct _cef_display_handler_t *self,
+                                            struct _cef_browser_t *browser,
+                                            cef_cursor_handle_t cursor,
+                                            cef_cursor_type_t type,
+                                            const cef_cursor_info_t *info) {
   (void)browser;
   (void)cursor;
   (void)info;
-  gocefOnCursorChange(CTX_OF(render, self)->handle, (int)type);
+  gocefOnCursorChange(CTX_OF(display, self)->handle, (int)type);
+  // 1 = handled. The host owns the cursor because there is no CEF window to own
+  // it, so default handling has nothing to act on.
+  return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +276,11 @@ cl_get_render_handler(struct _cef_client_t *self) {
 static struct _cef_life_span_handler_t *CEF_CALLBACK
 cl_get_life_span_handler(struct _cef_client_t *self) {
   return &CTX_OF(client, self)->life;
+}
+
+static struct _cef_display_handler_t *CEF_CALLBACK
+cl_get_display_handler(struct _cef_client_t *self) {
+  return &CTX_OF(client, self)->display;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +408,7 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
             client_has_one, client_has_any);
   c->client.get_render_handler = cl_get_render_handler;
   c->client.get_life_span_handler = cl_get_life_span_handler;
+  c->client.get_display_handler = cl_get_display_handler;
 
   init_base(&c->render.base, sizeof(c->render), render_add_ref, render_release,
             render_has_one, render_has_any);
@@ -398,12 +417,15 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
   c->render.on_accelerated_paint = rh_on_accelerated_paint;
   c->render.on_popup_show = rh_on_popup_show;
   c->render.on_popup_size = rh_on_popup_size;
-  c->render.on_cursor_change = rh_on_cursor_change;
 
   init_base(&c->life.base, sizeof(c->life), life_add_ref, life_release,
             life_has_one, life_has_any);
   c->life.on_after_created = ls_on_after_created;
   c->life.on_before_close = ls_on_before_close;
+
+  init_base(&c->display.base, sizeof(c->display), display_add_ref,
+            display_release, display_has_one, display_has_any);
+  c->display.on_cursor_change = dh_on_cursor_change;
 
   g_ctx[slot] = c;
 
