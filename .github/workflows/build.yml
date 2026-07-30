@@ -1,0 +1,31 @@
+# Compile both halves of the binding.
+#
+# The Linux job is the one that matters: it is the only place the cgo shim is
+# compiled against CEF's vendored headers. It needs no Chromium payload at all,
+# because libcef.so is dlopen'd at runtime rather than linked — which is exactly
+# the property that makes this cheap to check on every push.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (cgo, the real binding)
+        run: CGO_ENABLED=1 go build ./...
+      - name: Vet
+        run: CGO_ENABLED=1 go vet ./...
+      - name: Build the subprocess helper
+        run: cc -O2 -I internal/cefapi -DCEF_API_VERSION=13300 -o /tmp/cef_helper helper/helper.c -ldl
+      - name: Build the stub path (CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go build ./...
+      - name: Formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }

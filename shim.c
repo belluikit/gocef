@@ -1,0 +1,508 @@
+//go:build linux && cgo
+
+// CEF C API shim. See shim.h for the shape and the two structural decisions.
+
+// The API version is supplied by the build (see cef_linux.go's CFLAGS), which
+// keeps a single definition in version.go rather than one here and one there.
+#ifndef CEF_API_VERSION
+#error CEF_API_VERSION must be defined by the build
+#endif
+
+#include "shim.h"
+
+#include <dlfcn.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "include/capi/cef_app_capi.h"
+#include "include/capi/cef_browser_capi.h"
+#include "include/capi/cef_client_capi.h"
+#include "include/capi/cef_life_span_handler_capi.h"
+#include "include/capi/cef_render_handler_capi.h"
+
+#define MAX_SWITCHES 64
+#define MAX_BROWSERS 64
+
+// ---------------------------------------------------------------------------
+// libcef.so entry points, resolved at runtime.
+
+static void *g_lib;
+static char g_err[512];
+
+static const char *(*p_api_hash)(int, int);
+static int (*p_api_version)(void);
+static int (*p_initialize)(const cef_main_args_t *, const struct _cef_settings_t *,
+                           cef_app_t *, void *);
+static int (*p_execute_process)(const cef_main_args_t *, cef_app_t *, void *);
+static void (*p_shutdown)(void);
+static void (*p_do_message_loop_work)(void);
+static int (*p_create_browser)(const cef_window_info_t *, struct _cef_client_t *,
+                               const cef_string_t *,
+                               const struct _cef_browser_settings_t *,
+                               struct _cef_dictionary_value_t *,
+                               struct _cef_request_context_t *);
+static int (*p_utf8_to_utf16)(const char *, size_t, cef_string_t *);
+
+const char *gocef_error(void) { return g_err; }
+
+int gocef_compiled_api_version(void) { return CEF_API_VERSION; }
+
+static int resolve(void **slot, const char *name) {
+  *slot = dlsym(g_lib, name);
+  if (*slot == NULL) {
+    snprintf(g_err, sizeof(g_err), "libcef.so has no symbol %s", name);
+    return -1;
+  }
+  return 0;
+}
+
+static void setstr(cef_string_t *dst, const char *src) {
+  if (src != NULL && src[0] != '\0') {
+    p_utf8_to_utf16(src, strlen(src), dst);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-browser state.
+//
+// The three handler structs CEF needs are allocated together with the handle
+// they belong to, so a callback can recover the owning context by subtracting
+// the member's offset. That is what lets one shim serve many browsers without a
+// lookup table on the C side.
+//
+// Unlike the phase-0 probe — which used file-scope singletons and inert
+// refcounts because it created exactly one browser and never freed it — these
+// are real counts. CEF holds references to each handler independently and
+// releases them at times we do not control, so the context is freed when the
+// last one goes.
+
+typedef struct {
+  cef_client_t client;
+  cef_render_handler_t render;
+  cef_life_span_handler_t life;
+
+  atomic_int refs;
+  uint64_t handle;
+  cef_browser_t *browser;
+} ctx_t;
+
+static ctx_t *g_ctx[MAX_BROWSERS];
+
+#define CTX_OF(member, ptr) \
+  ((ctx_t *)((char *)(ptr) - offsetof(ctx_t, member)))
+
+static ctx_t *ctx_find(uint64_t handle) {
+  for (int i = 0; i < MAX_BROWSERS; i++) {
+    if (g_ctx[i] != NULL && g_ctx[i]->handle == handle) {
+      return g_ctx[i];
+    }
+  }
+  return NULL;
+}
+
+static void ctx_free(ctx_t *c) {
+  for (int i = 0; i < MAX_BROWSERS; i++) {
+    if (g_ctx[i] == c) {
+      g_ctx[i] = NULL;
+      break;
+    }
+  }
+  free(c);
+}
+
+// Every handler's refcount slots funnel into the context's single count: they
+// share a lifetime, so tracking them separately would buy nothing but bugs.
+static void ctx_ref(ctx_t *c) { atomic_fetch_add(&c->refs, 1); }
+
+static int ctx_unref(ctx_t *c) {
+  if (atomic_fetch_sub(&c->refs, 1) == 1) {
+    ctx_free(c);
+    return 1;
+  }
+  return 0;
+}
+
+#define REFCOUNT_IMPL(name, member)                                        \
+  static void CEF_CALLBACK name##_add_ref(cef_base_ref_counted_t *self) {  \
+    ctx_ref(CTX_OF(member, self));                                         \
+  }                                                                        \
+  static int CEF_CALLBACK name##_release(cef_base_ref_counted_t *self) {   \
+    return ctx_unref(CTX_OF(member, self));                                \
+  }                                                                        \
+  static int CEF_CALLBACK name##_has_one(cef_base_ref_counted_t *self) {   \
+    return atomic_load(&CTX_OF(member, self)->refs) == 1;                  \
+  }                                                                        \
+  static int CEF_CALLBACK name##_has_any(cef_base_ref_counted_t *self) {   \
+    return atomic_load(&CTX_OF(member, self)->refs) > 0;                   \
+  }
+
+REFCOUNT_IMPL(client, client)
+REFCOUNT_IMPL(render, render)
+REFCOUNT_IMPL(life, life)
+
+// init_base sets the size field CEF reads to tell API versions apart. Getting
+// it wrong truncates the struct silently, so it is always sizeof the real one.
+static void init_base(cef_base_ref_counted_t *base, size_t size,
+                      void (CEF_CALLBACK *add)(cef_base_ref_counted_t *),
+                      int (CEF_CALLBACK *rel)(cef_base_ref_counted_t *),
+                      int (CEF_CALLBACK *one)(cef_base_ref_counted_t *),
+                      int (CEF_CALLBACK *any)(cef_base_ref_counted_t *)) {
+  base->size = size;
+  base->add_ref = add;
+  base->release = rel;
+  base->has_one_ref = one;
+  base->has_at_least_one_ref = any;
+}
+
+// ---------------------------------------------------------------------------
+// cef_render_handler_t
+
+static void CEF_CALLBACK rh_get_view_rect(struct _cef_render_handler_t *self,
+                                          struct _cef_browser_t *browser,
+                                          cef_rect_t *rect) {
+  (void)browser;
+  ctx_t *c = CTX_OF(render, self);
+  int w = 0, h = 0;
+  gocefGetViewRect(c->handle, &w, &h);
+  // CEF requires a non-empty rectangle; a zero here is a hard failure inside
+  // the compositor rather than an empty view.
+  rect->x = 0;
+  rect->y = 0;
+  rect->width = w > 0 ? w : 1;
+  rect->height = h > 0 ? h : 1;
+}
+
+static void CEF_CALLBACK rh_on_paint(struct _cef_render_handler_t *self,
+                                     struct _cef_browser_t *browser,
+                                     cef_paint_element_type_t type,
+                                     size_t dirtyRectsCount,
+                                     cef_rect_t const *dirtyRects,
+                                     const void *buffer, int width, int height) {
+  (void)browser;
+  (void)dirtyRectsCount;
+  (void)dirtyRects;
+  gocefOnPaint(CTX_OF(render, self)->handle, (void *)buffer, width, height,
+               type == PET_POPUP);
+}
+
+static void CEF_CALLBACK rh_on_accelerated_paint(
+    struct _cef_render_handler_t *self, struct _cef_browser_t *browser,
+    cef_paint_element_type_t type, size_t dirtyRectsCount,
+    cef_rect_t const *dirtyRects, const cef_accelerated_paint_info_t *info) {
+  (void)browser;
+  (void)type;
+  (void)dirtyRectsCount;
+  (void)dirtyRects;
+  ctx_t *c = CTX_OF(render, self);
+  if (info == NULL || info->plane_count < 1) {
+    gocefOnAcceleratedPaint(c->handle, 0, -1, 0, 0, 0);
+    return;
+  }
+  gocefOnAcceleratedPaint(c->handle, info->plane_count, info->planes[0].fd,
+                          info->planes[0].stride, info->modifier, info->format);
+}
+
+static void CEF_CALLBACK rh_on_popup_show(struct _cef_render_handler_t *self,
+                                          struct _cef_browser_t *browser,
+                                          int show) {
+  (void)browser;
+  gocefOnPopupShow(CTX_OF(render, self)->handle, show);
+}
+
+static void CEF_CALLBACK rh_on_popup_size(struct _cef_render_handler_t *self,
+                                          struct _cef_browser_t *browser,
+                                          const cef_rect_t *rect) {
+  (void)browser;
+  gocefOnPopupSize(CTX_OF(render, self)->handle, rect->x, rect->y, rect->width,
+                   rect->height);
+}
+
+static void CEF_CALLBACK rh_on_cursor_change(struct _cef_render_handler_t *self,
+                                             struct _cef_browser_t *browser,
+                                             cef_cursor_handle_t cursor,
+                                             cef_cursor_type_t type,
+                                             const cef_cursor_info_t *info) {
+  (void)browser;
+  (void)cursor;
+  (void)info;
+  gocefOnCursorChange(CTX_OF(render, self)->handle, (int)type);
+}
+
+// ---------------------------------------------------------------------------
+// cef_life_span_handler_t
+
+static void CEF_CALLBACK ls_on_after_created(struct _cef_life_span_handler_t *self,
+                                             struct _cef_browser_t *browser) {
+  ctx_t *c = CTX_OF(life, self);
+  browser->base.add_ref(&browser->base);
+  c->browser = browser;
+  gocefOnAfterCreated(c->handle);
+}
+
+static void CEF_CALLBACK ls_on_before_close(struct _cef_life_span_handler_t *self,
+                                            struct _cef_browser_t *browser) {
+  (void)browser;
+  ctx_t *c = CTX_OF(life, self);
+  if (c->browser != NULL) {
+    c->browser->base.release(&c->browser->base);
+    c->browser = NULL;
+  }
+  gocefOnBeforeClose(c->handle);
+}
+
+// ---------------------------------------------------------------------------
+// cef_client_t
+
+static struct _cef_render_handler_t *CEF_CALLBACK
+cl_get_render_handler(struct _cef_client_t *self) {
+  return &CTX_OF(client, self)->render;
+}
+
+static struct _cef_life_span_handler_t *CEF_CALLBACK
+cl_get_life_span_handler(struct _cef_client_t *self) {
+  return &CTX_OF(client, self)->life;
+}
+
+// ---------------------------------------------------------------------------
+
+int gocef_load(const char *dir, int apiVersion) {
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/libcef.so", dir);
+
+  // RTLD_GLOBAL: CEF's own internals and its subprocesses expect these symbols
+  // to be visible process-wide.
+  g_lib = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+  if (g_lib == NULL) {
+    snprintf(g_err, sizeof(g_err), "cannot load %s: %s", path, dlerror());
+    return -1;
+  }
+
+  if (resolve((void **)&p_api_hash, "cef_api_hash") != 0 ||
+      resolve((void **)&p_api_version, "cef_api_version") != 0 ||
+      resolve((void **)&p_initialize, "cef_initialize") != 0 ||
+      resolve((void **)&p_execute_process, "cef_execute_process") != 0 ||
+      resolve((void **)&p_shutdown, "cef_shutdown") != 0 ||
+      resolve((void **)&p_do_message_loop_work, "cef_do_message_loop_work") != 0 ||
+      resolve((void **)&p_create_browser, "cef_browser_host_create_browser") != 0 ||
+      resolve((void **)&p_utf8_to_utf16, "cef_string_utf8_to_utf16") != 0) {
+    return -1;
+  }
+
+  // The version handshake, before any other CEF call. See shim.h.
+  p_api_hash(apiVersion, 0);
+  int got = p_api_version();
+  if (got != apiVersion) {
+    snprintf(g_err, sizeof(g_err),
+             "libcef refused API version %d, reports %d", apiVersion, got);
+    return -1;
+  }
+  return 0;
+}
+
+int gocef_execute_process(int argc, char **argv) {
+  cef_main_args_t args;
+  args.argc = argc;
+  args.argv = argv;
+  return p_execute_process(&args, NULL, NULL);
+}
+
+int gocef_initialize(const char *resourcesDir, const char *localesDir,
+                     const char *cachePath, const char *helperPath,
+                     const char *switches, int windowlessFrameRate) {
+  (void)windowlessFrameRate; // per-browser, applied in gocef_create_browser
+
+  static char *argv[MAX_SWITCHES + 1];
+  static char sw[2048];
+  int argc = 0;
+  argv[argc++] = (char *)"gocef";
+  if (switches != NULL && switches[0] != '\0') {
+    snprintf(sw, sizeof(sw), "%s", switches);
+    char *save = NULL;
+    for (char *tok = strtok_r(sw, " ", &save);
+         tok != NULL && argc < MAX_SWITCHES; tok = strtok_r(NULL, " ", &save)) {
+      argv[argc++] = tok;
+    }
+  }
+  argv[argc] = NULL;
+
+  cef_main_args_t args;
+  args.argc = argc;
+  args.argv = argv;
+
+  cef_settings_t settings;
+  memset(&settings, 0, sizeof(settings));
+  settings.size = sizeof(settings);
+  settings.no_sandbox = 1;
+  settings.windowless_rendering_enabled = 1;
+  settings.log_severity = LOGSEVERITY_WARNING;
+  settings.background_color = 0xFFFFFFFFu;
+  setstr(&settings.browser_subprocess_path, helperPath);
+  setstr(&settings.resources_dir_path, resourcesDir);
+  setstr(&settings.locales_dir_path, localesDir);
+  setstr(&settings.root_cache_path, cachePath);
+
+  if (p_initialize(&args, &settings, NULL, NULL) != 1) {
+    snprintf(g_err, sizeof(g_err), "cef_initialize failed");
+    return -1;
+  }
+  return 0;
+}
+
+void gocef_work(void) {
+  if (p_do_message_loop_work != NULL) {
+    p_do_message_loop_work();
+  }
+}
+
+void gocef_shutdown(void) {
+  if (p_shutdown != NULL) {
+    p_shutdown();
+  }
+}
+
+int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
+                         int sharedTexture) {
+  int slot = -1;
+  for (int i = 0; i < MAX_BROWSERS; i++) {
+    if (g_ctx[i] == NULL) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    snprintf(g_err, sizeof(g_err), "too many browsers (max %d)", MAX_BROWSERS);
+    return -1;
+  }
+
+  ctx_t *c = calloc(1, sizeof(ctx_t));
+  if (c == NULL) {
+    snprintf(g_err, sizeof(g_err), "out of memory");
+    return -1;
+  }
+  c->handle = handle;
+  // One reference for the shim itself; CEF adds its own as it takes the
+  // handlers.
+  atomic_init(&c->refs, 1);
+
+  init_base(&c->client.base, sizeof(c->client), client_add_ref, client_release,
+            client_has_one, client_has_any);
+  c->client.get_render_handler = cl_get_render_handler;
+  c->client.get_life_span_handler = cl_get_life_span_handler;
+
+  init_base(&c->render.base, sizeof(c->render), render_add_ref, render_release,
+            render_has_one, render_has_any);
+  c->render.get_view_rect = rh_get_view_rect;
+  c->render.on_paint = rh_on_paint;
+  c->render.on_accelerated_paint = rh_on_accelerated_paint;
+  c->render.on_popup_show = rh_on_popup_show;
+  c->render.on_popup_size = rh_on_popup_size;
+  c->render.on_cursor_change = rh_on_cursor_change;
+
+  init_base(&c->life.base, sizeof(c->life), life_add_ref, life_release,
+            life_has_one, life_has_any);
+  c->life.on_after_created = ls_on_after_created;
+  c->life.on_before_close = ls_on_before_close;
+
+  g_ctx[slot] = c;
+
+  cef_window_info_t wi;
+  memset(&wi, 0, sizeof(wi));
+  wi.size = sizeof(wi);
+  wi.windowless_rendering_enabled = 1;
+  wi.shared_texture_enabled = sharedTexture ? 1 : 0;
+  wi.bounds.width = w;
+  wi.bounds.height = h;
+
+  cef_browser_settings_t bs;
+  memset(&bs, 0, sizeof(bs));
+  bs.size = sizeof(bs);
+  // 60 rather than CEF's default of 30: bellui repaints at display rate, and a
+  // half-rate web view reads as stutter.
+  bs.windowless_frame_rate = 60;
+
+  cef_string_t curl;
+  memset(&curl, 0, sizeof(curl));
+  setstr(&curl, url);
+
+  if (p_create_browser(&wi, &c->client, &curl, &bs, NULL, NULL) != 1) {
+    snprintf(g_err, sizeof(g_err), "cef_browser_host_create_browser failed");
+    ctx_unref(c);
+    return -1;
+  }
+  return 0;
+}
+
+// host_of returns the browser host for a handle, with a reference the caller
+// must release.
+static cef_browser_host_t *host_of(uint64_t handle) {
+  ctx_t *c = ctx_find(handle);
+  if (c == NULL || c->browser == NULL) {
+    return NULL;
+  }
+  return c->browser->get_host(c->browser);
+}
+
+void gocef_close_browser(uint64_t handle) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host != NULL) {
+    host->close_browser(host, 1);
+    host->base.release(&host->base);
+  }
+  ctx_t *c = ctx_find(handle);
+  if (c != NULL) {
+    ctx_unref(c); // drop the shim's own reference
+  }
+}
+
+void gocef_resize(uint64_t handle, int w, int h) {
+  (void)w;
+  (void)h;
+  cef_browser_host_t *host = host_of(handle);
+  if (host != NULL) {
+    // CEF re-reads the size through get_view_rect, which the Go side answers.
+    host->was_resized(host);
+    host->base.release(&host->base);
+  }
+}
+
+void gocef_set_visible(uint64_t handle, int visible) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host != NULL) {
+    host->was_hidden(host, visible ? 0 : 1);
+    host->base.release(&host->base);
+  }
+}
+
+void gocef_set_focus(uint64_t handle, int focused) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host != NULL) {
+    host->set_focus(host, focused ? 1 : 0);
+    host->base.release(&host->base);
+  }
+}
+
+void gocef_invalidate(uint64_t handle) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host != NULL) {
+    host->invalidate(host, PET_VIEW);
+    host->base.release(&host->base);
+  }
+}
+
+void gocef_load_url(uint64_t handle, const char *url) {
+  ctx_t *c = ctx_find(handle);
+  if (c == NULL || c->browser == NULL) {
+    return;
+  }
+  cef_frame_t *frame = c->browser->get_main_frame(c->browser);
+  if (frame == NULL) {
+    return;
+  }
+  cef_string_t curl;
+  memset(&curl, 0, sizeof(curl));
+  setstr(&curl, url);
+  frame->load_url(frame, &curl);
+  frame->base.release(&frame->base);
+}

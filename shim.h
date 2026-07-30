@@ -1,0 +1,138 @@
+// Shim between Go and CEF's C API.
+//
+// Go never sees a CEF struct. Everything on the other side of this header is
+// plain scalars and opaque handles, so cgo does not have to describe CEF's type
+// graph and the Go side stays free of unsafe pointer arithmetic.
+//
+// Two structural decisions live here, both carried over from the #60 phase-0
+// probe (belluikit/bellui#102), which proved them on real hardware:
+//
+//   - We bind the **C API**. It is exported directly from libcef.so, so
+//     libcef_dll_wrapper and the C++ ABI are not involved at all.
+//   - libcef.so is resolved with **dlopen at runtime**, never linked. Nothing
+//     here needs CEF present to build, so `go build` is hermetic on machines
+//     that have never seen a Chromium payload.
+
+#ifndef GOCEF_SHIM_H
+#define GOCEF_SHIM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+// ---------------------------------------------------------------------------
+// Library and process lifecycle.
+
+// gocef_load dlopens libcef.so from dir, resolves the entry points this shim
+// uses, and performs the API-version handshake with apiVersion.
+//
+// The handshake is not optional and cef_api_hash is what performs it, despite
+// reading like a query: its documentation says it "configures the CEF API
+// version ... any changes to this value will be ignored after the first call".
+// Without it libcef has no configured version, cef_api_version() reports -1,
+// and the C-to-C++ layer fatally rejects the first struct it is handed, naming
+// whichever type it happened to be validating.
+//
+// Returns 0 on success. On failure gocef_error describes it.
+int gocef_load(const char *dir, int apiVersion);
+
+// gocef_initialize starts the CEF browser process. helperPath is the subprocess
+// executable; switches is a space-separated Chromium command line appended to
+// argv, which Chromium propagates to the subprocesses it launches.
+//
+// Must be called from the thread that will pump the message loop.
+int gocef_initialize(const char *resourcesDir, const char *localesDir,
+                     const char *cachePath, const char *helperPath,
+                     const char *switches, int windowlessFrameRate);
+
+// gocef_work runs one iteration of CEF's message loop. It must be called from
+// the same thread that called gocef_initialize — CEF's browser UI thread.
+void gocef_work(void);
+
+// gocef_shutdown shuts CEF down. No CEF call may follow it in this process, and
+// cef_initialize cannot be called a second time either: initialization is
+// once-per-process.
+void gocef_shutdown(void);
+
+// gocef_error returns the last failure message, or "" if there was none.
+const char *gocef_error(void);
+
+// gocef_compiled_api_version reports the CEF_API_VERSION this shim was built
+// with. The Go constant and the -D flag that reaches the compiler are two
+// declarations of one fact, and Load asserts they agree — a mismatch would
+// otherwise show up as struct sizes that disagree with the handshake, which
+// fails far from its cause.
+int gocef_compiled_api_version(void);
+
+// gocef_execute_process is the subprocess entry point, for a helper binary that
+// links this shim rather than shipping its own copy. Returns the process exit
+// code for a recognised subprocess, or -1 for the browser process.
+int gocef_execute_process(int argc, char **argv);
+
+// ---------------------------------------------------------------------------
+// Browsers.
+//
+// Each browser is identified by a handle the Go side allocates. Every callback
+// carries it, so Go can find the owning object without CEF pointers ever
+// reaching Go.
+
+// gocef_create_browser creates a windowless browser. sharedTexture requests
+// dma-buf delivery through the accelerated-paint callback instead of CPU
+// buffers; it additionally requires a live display session and Chromium's
+// native Vulkan renderer (see belluikit/bellui#102).
+int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
+                         int sharedTexture);
+
+// gocef_close_browser closes a browser and releases the shim state that backs
+// its handle.
+void gocef_close_browser(uint64_t handle);
+
+// gocef_resize tells CEF the view is now w*h pixels and asks for a repaint.
+void gocef_resize(uint64_t handle, int w, int h);
+
+// gocef_set_visible drives CefBrowserHost::WasHidden. A windowless browser has
+// no window whose visibility CEF can observe, so it has to be told — this is
+// what a host drives from Show/Hide and from scrolling out of a clipping
+// ancestor.
+void gocef_set_visible(uint64_t handle, int visible);
+
+// gocef_set_focus drives CefBrowserHost::SetFocus.
+void gocef_set_focus(uint64_t handle, int focused);
+
+// gocef_invalidate asks for a repaint of the whole view.
+void gocef_invalidate(uint64_t handle);
+
+// gocef_load_url navigates the main frame.
+void gocef_load_url(uint64_t handle, const char *url);
+
+// ---------------------------------------------------------------------------
+// Callbacks into Go. All are called on CEF's browser UI thread, which is the
+// thread that pumps the loop.
+
+// gocefOnPaint delivers a CPU frame: BGRA, upper-left origin, w*h*4 bytes,
+// valid only for the duration of the call.
+extern void gocefOnPaint(uint64_t handle, void *buffer, int w, int h, int isPopup);
+
+// gocefOnAcceleratedPaint delivers a dma-buf frame. The fd is valid ONLY inside
+// this call: CEF documents that the resource "cannot be cached and cannot be
+// accessed outside of this callback" and that its contents "should be copied to
+// a texture owned by the client application" (belluikit/bellui#113).
+extern void gocefOnAcceleratedPaint(uint64_t handle, int planeCount, int fd,
+                                    uint32_t stride, uint64_t modifier, int format);
+
+// gocefOnPopupShow and gocefOnPopupSize report the separate surface CEF uses for
+// <select> dropdowns. A host that ignores them renders dropdowns invisible.
+extern void gocefOnPopupShow(uint64_t handle, int show);
+extern void gocefOnPopupSize(uint64_t handle, int x, int y, int w, int h);
+
+// gocefOnCursorChange reports a requested cursor as a cef_cursor_type_t.
+extern void gocefOnCursorChange(uint64_t handle, int cursorType);
+
+// gocefGetViewRect asks the host for the current view size in pixels. CEF
+// requires a non-empty rectangle, so the Go side must always answer.
+extern void gocefGetViewRect(uint64_t handle, int *w, int *h);
+
+// gocefOnAfterCreated and gocefOnBeforeClose bracket the browser's life.
+extern void gocefOnAfterCreated(uint64_t handle);
+extern void gocefOnBeforeClose(uint64_t handle);
+
+#endif // GOCEF_SHIM_H
