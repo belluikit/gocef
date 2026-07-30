@@ -3,7 +3,12 @@
 # The Linux job is the one that matters: it is the only place the cgo shim is
 # compiled against CEF's vendored headers. It needs no Chromium payload at all,
 # because libcef.so is dlopen'd at runtime rather than linked — which is exactly
-# the property that makes this cheap to check on every push.
+# the property that makes this cheap to check on every push, and why a plain
+# GitHub-hosted runner is enough here rather than the self-hosted fleet bellui
+# needs for its GPU and display work.
+#
+# Hosted also means amd64, which is the primary target for this binding; the
+# fleet's Linux runner is ARM64.
 name: Build
 
 on:
@@ -16,9 +21,14 @@ permissions:
 
 jobs:
   linux:
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Exact, and self-maintaining: the fleet runs a patched toolchain at
+          # this version, and a hosted runner has to be told which to install.
+          go-version-file: go.mod
       - name: Build (cgo, the real binding)
         run: CGO_ENABLED=1 go build ./...
       - name: Vet
