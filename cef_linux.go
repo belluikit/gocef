@@ -228,7 +228,9 @@ func Shutdown() {
 // the browser process.
 //
 // Prefer the prebuilt C helper: see Config.HelperPath for why a Go binary is a
-// poor Chromium subprocess.
+// poor Chromium subprocess. This path is UNVERIFIED — every runtime pass so far
+// used the C helper — so treat it as a sketch of what a Go helper would call,
+// not as a supported alternative (belluikit/bellui#117).
 func ExecuteProcess(args []string) int {
 	argv := make([]*C.char, len(args)+1)
 	for i, a := range args {

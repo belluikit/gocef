@@ -43,7 +43,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/cef-payload
-          key: cef-payload-${{ env.CEF_VERSION }}-linux64
+          # helper.c is part of the key: the cached payload embeds a compiled
+          # helper, and a cache keyed on the CEF version alone kept serving the
+          # old binary after helper.c changed — the run that first went green
+          # was in fact still using the previous helper.
+          key: cef-payload-${{ env.CEF_VERSION }}-linux64-${{ hashFiles('helper/helper.c') }}
 
       - name: Stage the payload
         if: steps.payload.outputs.cache-hit != 'true'

@@ -200,6 +200,7 @@ func TestCEFRuntime(t *testing.T) {
 	testFrames(t)
 	testResize(t)
 	testHiDPI(t)
+	testVisibility(t)
 	testTwoBrowsers(t)
 }
 
@@ -329,6 +330,40 @@ func testHiDPI(t *testing.T) {
 // phase-0 probe only ever created one browser and used file-scope singletons
 // with inert refcounts; this is the first thing that would break if the
 // container_of recovery or the refcounting were wrong.
+// testVisibility exercises the one lifecycle call nothing else touches: a
+// windowless browser has no window whose visibility CEF can observe, so
+// SetVisible is what a host drives from show/hide — hidden must stop frames,
+// and showing again must restart them without recreating anything.
+func testVisibility(t *testing.T) {
+	t.Log("--- section: visibility")
+	h := newHandler("visibility", 320, 240, 1)
+	b, err := gocef.NewBrowser(probePage, 320, 240, false, h)
+	if err != nil {
+		t.Fatalf("NewBrowser: %v", err)
+	}
+	defer closeAndDrain(t, b, h)
+
+	if !pump(func() bool { _, ok := h.lastFrame(); return ok }, 20*time.Second) {
+		t.Fatal("no initial frame")
+	}
+
+	b.SetVisible(false)
+	// Drain deliveries already in flight, then measure quiet.
+	pump(func() bool { return false }, 300*time.Millisecond)
+	before := h.frameCount()
+	pump(func() bool { return false }, 700*time.Millisecond)
+	if after := h.frameCount(); after != before {
+		t.Errorf("hidden browser painted %d more frames; WasHidden is not reaching CEF", after-before)
+	}
+
+	b.SetVisible(true)
+	b.Invalidate()
+	resumed := pump(func() bool { return h.frameCount() > before }, 10*time.Second)
+	if !resumed {
+		t.Error("no frame after SetVisible(true) + Invalidate; the browser did not wake")
+	}
+}
+
 func testTwoBrowsers(t *testing.T) {
 	t.Log("--- section: two browsers")
 	var hs []*handler
