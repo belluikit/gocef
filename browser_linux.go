@@ -389,6 +389,143 @@ type DevToolsHandler interface {
 	DevToolsMessage(msg []byte)
 }
 
+// ErrAborted is the Chromium net error code of a cancelled navigation — one
+// refused by NavigationHandler.BeforeBrowse, stopped with StopLoad, or
+// replaced by a newer navigation. It reaches LoadHandler.LoadError like any
+// other failure, so a consumer that reports its own cancellations filters it
+// there. The value is net::ERR_ABORTED from Chromium's net_error_list.h; CEF
+// does not re-declare it in its headers.
+const ErrAborted = -3
+
+// LoadHandler is an optional capability on a Handler: implement it to observe
+// the browser's load progress. A Handler that does not is simply never told.
+type LoadHandler interface {
+	// LoadingStateChanged fires exactly twice per navigation: once when
+	// loading begins and once when it settles — by completing, failing or
+	// being cancelled. It fires before any LoadError of the same navigation's
+	// end. url is the main frame's URL at that moment.
+	LoadingStateChanged(loading bool, url string)
+
+	// LoadError reports a navigation that failed or was cancelled. code is a
+	// Chromium net error (see ErrAborted for the one worth special-casing),
+	// errorText its short name, and url the address that did not load.
+	LoadError(mainFrame bool, code int, errorText, url string)
+}
+
+// NavigationEvent is a navigation the browser is about to start, offered to
+// NavigationHandler.BeforeBrowse.
+type NavigationEvent struct {
+	// URL is where the browser is about to go.
+	URL string
+
+	// Transition says what started the navigation, as a
+	// cef_transition_type_t value: mask with TransitionSourceMask for the
+	// source, test TransitionForwardBackFlag for history moves.
+	Transition uint32
+
+	// MainFrame reports the view's own navigation rather than a sub-frame's.
+	MainFrame bool
+
+	// UserGesture reports an explicit user action (e.g. clicking a link)
+	// rather than an automatic navigation.
+	UserGesture bool
+
+	// Redirect reports a server- or script-initiated redirect.
+	Redirect bool
+}
+
+// Transition source values and flags for NavigationEvent.Transition, matching
+// cef_transition_type_t.
+const (
+	TransitionLink            = 0
+	TransitionExplicit        = 1
+	TransitionAutoSubframe    = 3
+	TransitionManualSubframe  = 4
+	TransitionFormSubmit      = 7
+	TransitionReload          = 8
+	TransitionSourceMask      = 0xFF
+	TransitionForwardBackFlag = 0x01000000
+)
+
+// NavigationHandler is an optional capability on a Handler: implement it to
+// decide navigations before they start. Without it every navigation proceeds
+// and popup requests are dropped.
+type NavigationHandler interface {
+	// BeforeBrowse is consulted before each navigation. The engine is blocked
+	// on the answer, so it must return promptly. Return false to cancel; a
+	// cancelled navigation additionally reports LoadError with ErrAborted.
+	BeforeBrowse(ev NavigationEvent) bool
+
+	// BeforePopup reports the page asking to open url in a new window —
+	// target="_blank" or window.open. The popup itself is always refused: a
+	// windowless browser has nowhere to host a second window. The handler
+	// decides what becomes of the URL, typically by loading it in this
+	// browser or ignoring it.
+	BeforePopup(url string, userGesture bool)
+}
+
+// goStringN copies a shim-owned UTF-8 buffer that may be NULL.
+func goStringN(p unsafe.Pointer, n C.int) string {
+	if p == nil || n <= 0 {
+		return ""
+	}
+	return string(unsafe.Slice((*byte)(p), int(n)))
+}
+
+//export gocefOnLoadingStateChange
+func gocefOnLoadingStateChange(handle C.uint64_t, isLoading C.int, url unsafe.Pointer, urlLen C.int) {
+	b := lookup(handle)
+	if b == nil {
+		return
+	}
+	if h, ok := b.handler.(LoadHandler); ok {
+		h.LoadingStateChanged(isLoading != 0, goStringN(url, urlLen))
+	}
+}
+
+//export gocefOnLoadError
+func gocefOnLoadError(handle C.uint64_t, isMainFrame, errorCode C.int, errorText unsafe.Pointer, errorTextLen C.int, url unsafe.Pointer, urlLen C.int) {
+	b := lookup(handle)
+	if b == nil {
+		return
+	}
+	if h, ok := b.handler.(LoadHandler); ok {
+		h.LoadError(isMainFrame != 0, int(errorCode),
+			goStringN(errorText, errorTextLen), goStringN(url, urlLen))
+	}
+}
+
+//export gocefOnBeforeBrowse
+func gocefOnBeforeBrowse(handle C.uint64_t, url unsafe.Pointer, urlLen C.int, transition C.uint32_t, isMainFrame, userGesture, isRedirect C.int) C.int {
+	b := lookup(handle)
+	if b == nil {
+		return 1 // a browser Go has forgotten has no policy left to consult
+	}
+	h, ok := b.handler.(NavigationHandler)
+	if !ok {
+		return 1
+	}
+	allowed := h.BeforeBrowse(NavigationEvent{
+		URL:         goStringN(url, urlLen),
+		Transition:  uint32(transition),
+		MainFrame:   isMainFrame != 0,
+		UserGesture: userGesture != 0,
+		Redirect:    isRedirect != 0,
+	})
+	return cbool(allowed)
+}
+
+//export gocefOnBeforePopup
+func gocefOnBeforePopup(handle C.uint64_t, url unsafe.Pointer, urlLen C.int, userGesture C.int) {
+	b := lookup(handle)
+	if b == nil {
+		return
+	}
+	if h, ok := b.handler.(NavigationHandler); ok {
+		h.BeforePopup(goStringN(url, urlLen), userGesture != 0)
+	}
+}
+
 //export gocefOnDevToolsMessage
 func gocefOnDevToolsMessage(handle C.uint64_t, msg unsafe.Pointer, n C.int) {
 	b := lookup(handle)
