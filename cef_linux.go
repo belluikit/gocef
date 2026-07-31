@@ -112,9 +112,25 @@ type Config struct {
 	// a Go program cannot serve as its own Chromium subprocess.
 	HelperPath string
 
-	// CachePath is where Chromium keeps its profile. Empty means a temporary
-	// one, discarded on exit.
+	// CachePath is where Chromium persists the profile — cookies,
+	// localStorage, the HTTP cache. Empty means "incognito": everything is
+	// kept in memory and discarded on exit. Non-empty must be an absolute
+	// path, equal to or under RootCachePath when that is set.
 	CachePath string
+
+	// RootCachePath is the root for installation-specific data and the
+	// process-singleton lock CEF (120+) takes to stop two processes
+	// corrupting one profile. Empty defaults to CachePath. When both are
+	// empty Chromium falls back to a per-user directory shared by every
+	// CEF application on the machine (~/.config/cef_user_data on Linux),
+	// which CEF itself advises against — unrelated applications then contend
+	// for one singleton lock. Set it even when CachePath is empty, so an
+	// incognito application still has its own lock location.
+	//
+	// When another process already holds the lock, Initialize fails; CEF
+	// cannot be initialized a second time in the same process, so that
+	// failure is permanent for the process.
+	RootCachePath string
 
 	// Switches are extra Chromium command-line switches. Chromium propagates
 	// them to the subprocesses it launches, so they need setting only here.
@@ -157,6 +173,8 @@ func Initialize(cfg Config) error {
 	defer C.free(unsafe.Pointer(loc))
 	cache := C.CString(cfg.CachePath)
 	defer C.free(unsafe.Pointer(cache))
+	rootCache := C.CString(cfg.RootCachePath)
+	defer C.free(unsafe.Pointer(rootCache))
 	helper := C.CString(cfg.HelperPath)
 	defer C.free(unsafe.Pointer(helper))
 	sw := C.CString(joinSwitches(cfg.Switches))
@@ -165,7 +183,7 @@ func Initialize(cfg Config) error {
 	lf := C.CString(cfg.LogFile)
 	defer C.free(unsafe.Pointer(lf))
 
-	if C.gocef_initialize(res, loc, cache, helper, sw, 60, lf) != 0 {
+	if C.gocef_initialize(res, loc, cache, rootCache, helper, sw, 60, lf) != 0 {
 		return fmt.Errorf("gocef: %s", C.GoString(C.gocef_error()))
 	}
 	started = true

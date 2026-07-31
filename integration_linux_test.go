@@ -159,10 +159,11 @@ func TestCEFRuntime(t *testing.T) {
 	// nothing; on failure the tail is dumped alongside the callback counters.
 	cefLog := t.TempDir() + "/cef.log"
 
+	cachePath := t.TempDir()
 	if err := gocef.Initialize(gocef.Config{
 		Dir:        dir,
 		HelperPath: dir + "/cef_helper",
-		CachePath:  t.TempDir(),
+		CachePath:  cachePath,
 		Switches:   switches,
 		LogFile:    cefLog,
 	}); err != nil {
@@ -199,6 +200,7 @@ func TestCEFRuntime(t *testing.T) {
 	// "succeeds" and then nothing ever happens, with all shim counters at
 	// zero. The probe's thread trap, re-entered through the testing package.
 	testFrames(t)
+	testProfileOnDisk(t, cachePath)
 	testResize(t)
 	testHiDPI(t)
 	testVisibility(t)
@@ -272,6 +274,31 @@ func testFrames(t *testing.T) {
 			"B=%#x G=%#x R=%#x, want B=%#x G=%#x R=%#x — either the page never "+
 			"rendered or the channel order is not BGRA",
 			bl, gr, rd, pageColorB, pageColorG, pageColorR)
+	}
+}
+
+// testProfileOnDisk asserts Config.CachePath reached CEF's cache_path. The
+// discriminator is the "Default" profile directory Chromium creates under a
+// non-empty cache_path and nowhere else: when only root_cache_path is set —
+// the defect this section guards against — the directory holds installation
+// data but no profile, and browsers silently run incognito. Cross-process
+// persistence itself (cookies surviving a restart) cannot be tested here,
+// since CEF initializes once per process; bellui's hack/cefhostprobe carries
+// that half.
+func testProfileOnDisk(t *testing.T, cachePath string) {
+	t.Log("--- section: profile on disk")
+	ok := pump(func() bool {
+		st, err := os.Stat(cachePath + "/Default")
+		return err == nil && st.IsDir()
+	}, 10*time.Second)
+	if !ok {
+		entries, _ := os.ReadDir(cachePath)
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("no Default profile directory appeared under CachePath within 10s; "+
+			"cache_path was not honoured and the profile is in-memory (dir holds %v)", names)
 	}
 }
 

@@ -39,14 +39,21 @@ int gocef_load(const char *dir, int apiVersion);
 // executable; switches is a space-separated Chromium command line appended to
 // argv, which Chromium propagates to the subprocesses it launches.
 //
+// cachePath is CEF's cache_path — where the profile (cookies, localStorage,
+// HTTP cache) persists; empty means incognito. rootCachePath is CEF's
+// root_cache_path — installation-specific data and the process-singleton
+// lock; empty falls back to cachePath, and with both empty Chromium uses a
+// per-user directory shared by every CEF application, which CEF warns
+// against.
+//
 // Must be called from the thread that will pump the message loop.
 // logFile, when non-empty, raises CEF's log severity to VERBOSE and writes
 // Chromium's own logging there — the diagnostic for a browser that silently
 // does nothing.
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
-                     const char *cachePath, const char *helperPath,
-                     const char *switches, int windowlessFrameRate,
-                     const char *logFile);
+                     const char *cachePath, const char *rootCachePath,
+                     const char *helperPath, const char *switches,
+                     int windowlessFrameRate, const char *logFile);
 
 // gocef_work runs one iteration of CEF's message loop. It must be called from
 // the same thread that called gocef_initialize — CEF's browser UI thread.

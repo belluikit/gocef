@@ -570,9 +570,9 @@ int gocef_execute_process(int argc, char **argv) {
 }
 
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
-                     const char *cachePath, const char *helperPath,
-                     const char *switches, int windowlessFrameRate,
-                     const char *logFile) {
+                     const char *cachePath, const char *rootCachePath,
+                     const char *helperPath, const char *switches,
+                     int windowlessFrameRate, const char *logFile) {
   (void)windowlessFrameRate; // per-browser, applied in gocef_create_browser
 
   static char *argv[MAX_SWITCHES + 1];
@@ -610,7 +610,14 @@ int gocef_initialize(const char *resourcesDir, const char *localesDir,
   setstr(&settings.browser_subprocess_path, helperPath);
   setstr(&settings.resources_dir_path, resourcesDir);
   setstr(&settings.locales_dir_path, localesDir);
-  setstr(&settings.root_cache_path, cachePath);
+  // cache_path is the profile; empty means incognito. root_cache_path holds
+  // installation data and the process-singleton lock — CEF defaults it to
+  // cache_path, but pass it explicitly so an incognito caller can still keep
+  // the singleton lock out of the shared per-user default directory.
+  setstr(&settings.cache_path, cachePath);
+  setstr(&settings.root_cache_path,
+         (rootCachePath != NULL && rootCachePath[0] != '\0') ? rootCachePath
+                                                             : cachePath);
 
   if (p_initialize(&args, &settings, NULL, NULL) != 1) {
     snprintf(g_err, sizeof(g_err), "cef_initialize failed");
