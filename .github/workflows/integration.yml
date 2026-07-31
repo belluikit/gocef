@@ -1,0 +1,80 @@
+# Run the binding against a real CEF payload (belluikit/bellui#117).
+#
+# Everything else in CI compiles; this is the only place anything runs. It
+# proves the API-version pin, the per-browser handler contexts, the refcounting,
+# frame delivery and the HiDPI scale — all of which were reasoned about and
+# never executed.
+#
+# No GPU and no display server are needed: CEF falls back to software
+# compositing under --ozone-platform=headless, which the phase-0 probe
+# established by producing frames on a bare tty.
+name: Integration
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CEF_VERSION: "151.3.12+gd9cea67+chromium-151.0.7922.47"
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # The payload is cached because building it is the slow part: a 321 MB
+      # download and a 1.4 GB unpack. Keyed on the CEF version, so a pin bump
+      # rebuilds it and nothing else does.
+      #
+      # It is fetched from upstream rather than from belluikit/gocef-libs'
+      # release, which would be smaller and already stripped — but that repo is
+      # private, and this workflow's GITHUB_TOKEN is scoped to this repository
+      # only. Switching to it needs a cross-repo token in secrets; until then
+      # upstream is the option that needs no credentials.
+      - name: Cache the CEF payload
+        id: payload
+        uses: actions/cache@v4
+        with:
+          path: ~/cef-payload
+          key: cef-payload-${{ env.CEF_VERSION }}-linux64
+
+      - name: Stage the payload
+        if: steps.payload.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet || true
+          encoded="${CEF_VERSION//+/%2B}"
+          curl -fSL --retry 3 -o cef.tar.bz2 \
+            "https://cef-builds.spotifycdn.com/cef_binary_${encoded}_linux64_minimal.tar.bz2"
+          mkdir -p work "$HOME/cef-payload"
+          tar -xjf cef.tar.bz2 -C work
+          dist="work/cef_binary_${CEF_VERSION}_linux64_minimal"
+
+          cp "$dist/Release/libcef.so" "$HOME/cef-payload/libcef.so"
+          strip --strip-all "$HOME/cef-payload/libcef.so"
+          for f in libvk_swiftshader.so libvulkan.so.1 libEGL.so libGLESv2.so \
+                   snapshot_blob.bin v8_context_snapshot.bin vk_swiftshader_icd.json; do
+            [ -f "$dist/Release/$f" ] && cp "$dist/Release/$f" "$HOME/cef-payload/" || true
+          done
+
+          # Flat, beside libcef.so — a nested Resources/ fails inside ICU with
+          # "Invalid file descriptor to ICU data received" and a core dump.
+          cp -r "$dist/Resources/." "$HOME/cef-payload/"
+
+          cc -O2 -I "$dist" -DCEF_API_VERSION=13300 \
+             -o "$HOME/cef-payload/cef_helper" helper/helper.c -ldl
+
+          rm -rf work cef.tar.bz2
+          du -sh "$HOME/cef-payload"
+
+      - name: Run against the payload
+        env:
+          GOCEF_PAYLOAD: /home/runner/cef-payload
+        run: CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./...
