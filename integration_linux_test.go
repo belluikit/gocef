@@ -239,25 +239,35 @@ func testFrames(t *testing.T) {
 	if !pump(h.wasCreated, 20*time.Second) {
 		t.Fatal("Created callback never fired")
 	}
-	if !pump(func() bool { _, ok := h.lastFrame(); return ok }, 20*time.Second) {
+
+	// Wait for a frame carrying the page, not merely a frame: the compositor's
+	// first delivery can be its initial clear, painted before the renderer has
+	// produced the document — on a fast machine that frame arrives first and a
+	// pixel assertion against it fails black. Content is the condition, and it
+	// doubles as the BGRA byte-order check: a channel swap can never match.
+	ok := pump(func() bool {
+		f, got := h.lastFrame()
+		if !got || len(f.pix) < 4 {
+			return false
+		}
+		return f.pix[0] == pageColorB && f.pix[1] == pageColorG && f.pix[2] == pageColorR
+	}, 20*time.Second)
+
+	f, got := h.lastFrame()
+	if !got {
 		t.Fatal("no frame arrived through Paint within 20s")
 	}
-
-	f, _ := h.lastFrame()
 	if f.w != 400 || f.h != 300 {
 		t.Errorf("frame is %dx%d, want 400x300", f.w, f.h)
 	}
 	if got, want := len(f.pix), f.w*f.h*4; got != want {
 		t.Fatalf("buffer is %d bytes, want %d (w*h*4)", got, want)
 	}
-
-	// CEF hands over BGRA with an upper-left origin. Checking the actual byte
-	// order matters: a channel swap is invisible in a size assertion and very
-	// visible on screen.
-	bl, gr, rd := f.pix[0], f.pix[1], f.pix[2]
-	if rd != pageColorR || gr != pageColorG || bl != pageColorB {
-		t.Errorf("first pixel is B=%#x G=%#x R=%#x, want B=%#x G=%#x R=%#x — "+
-			"either the page did not render or the channel order is not BGRA",
+	if !ok {
+		bl, gr, rd := f.pix[0], f.pix[1], f.pix[2]
+		t.Errorf("no frame ever matched the page colour; last first-pixel is "+
+			"B=%#x G=%#x R=%#x, want B=%#x G=%#x R=%#x — either the page never "+
+			"rendered or the channel order is not BGRA",
 			bl, gr, rd, pageColorB, pageColorG, pageColorR)
 	}
 }
