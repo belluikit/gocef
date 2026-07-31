@@ -31,7 +31,18 @@
 // libcef.so entry points, resolved at runtime.
 
 static void *g_lib;
-static char g_err[512];
+static char g_err[1400]; // fits a full path plus a dlerror without truncation
+
+static _Atomic long g_counters[GOCEF_N_COUNTERS];
+
+long gocef_counter(int which) {
+  if (which < 0 || which >= GOCEF_N_COUNTERS) {
+    return -1;
+  }
+  return atomic_load(&g_counters[which]);
+}
+
+#define COUNT(which) atomic_fetch_add(&g_counters[which], 1)
 
 static const char *(*p_api_hash)(int, int);
 static int (*p_api_version)(void);
@@ -175,6 +186,7 @@ static void CEF_CALLBACK rh_get_view_rect(struct _cef_render_handler_t *self,
                                           cef_rect_t *rect) {
   (void)browser;
   ctx_t *c = CTX_OF(render, self);
+  COUNT(GOCEF_N_GET_VIEW_RECT);
   int w = 0, h = 0;
   gocefGetViewRect(c->handle, &w, &h);
   // CEF requires a non-empty rectangle; a zero here is a hard failure inside
@@ -190,6 +202,7 @@ static int CEF_CALLBACK rh_get_screen_info(struct _cef_render_handler_t *self,
                                            cef_screen_info_t *info) {
   (void)browser;
   ctx_t *c = CTX_OF(render, self);
+  COUNT(GOCEF_N_GET_SCREEN_INFO);
 
   info->device_scale_factor = gocefGetScreenScale(c->handle);
   info->depth = 32;
@@ -220,6 +233,7 @@ static void CEF_CALLBACK rh_on_paint(struct _cef_render_handler_t *self,
   (void)browser;
   (void)dirtyRectsCount;
   (void)dirtyRects;
+  COUNT(GOCEF_N_PAINT);
   gocefOnPaint(CTX_OF(render, self)->handle, (void *)buffer, width, height,
                type == PET_POPUP);
 }
@@ -283,6 +297,7 @@ static int CEF_CALLBACK dh_on_cursor_change(struct _cef_display_handler_t *self,
 static void CEF_CALLBACK ls_on_after_created(struct _cef_life_span_handler_t *self,
                                              struct _cef_browser_t *browser) {
   ctx_t *c = CTX_OF(life, self);
+  COUNT(GOCEF_N_AFTER_CREATED);
   browser->base.add_ref(&browser->base);
   c->browser = browser;
 
@@ -301,6 +316,7 @@ static void CEF_CALLBACK ls_on_before_close(struct _cef_life_span_handler_t *sel
                                             struct _cef_browser_t *browser) {
   (void)browser;
   ctx_t *c = CTX_OF(life, self);
+  COUNT(GOCEF_N_BEFORE_CLOSE);
   if (c->devtools_reg != NULL) {
     c->devtools_reg->base.release(&c->devtools_reg->base);
     c->devtools_reg = NULL;
@@ -412,7 +428,8 @@ int gocef_execute_process(int argc, char **argv) {
 
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
                      const char *cachePath, const char *helperPath,
-                     const char *switches, int windowlessFrameRate) {
+                     const char *switches, int windowlessFrameRate,
+                     const char *logFile) {
   (void)windowlessFrameRate; // per-browser, applied in gocef_create_browser
 
   static char *argv[MAX_SWITCHES + 1];
@@ -439,6 +456,13 @@ int gocef_initialize(const char *resourcesDir, const char *localesDir,
   settings.no_sandbox = 1;
   settings.windowless_rendering_enabled = 1;
   settings.log_severity = LOGSEVERITY_WARNING;
+  if (logFile != NULL && logFile[0] != '\0') {
+    // Chromium's own account of a silent failure: everything the browser,
+    // renderer and GPU processes log lands here. VERBOSE, because the failures
+    // this exists for are the ones that print nothing at WARNING.
+    settings.log_severity = LOGSEVERITY_VERBOSE;
+    setstr(&settings.log_file, logFile);
+  }
   settings.background_color = 0xFFFFFFFFu;
   setstr(&settings.browser_subprocess_path, helperPath);
   setstr(&settings.resources_dir_path, resourcesDir);
@@ -543,9 +567,9 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
   ctx_ref(c);
 
   if (p_create_browser(&wi, &c->client, &curl, &bs, NULL, NULL) != 1) {
-    ctx_unref(c); // CEF did not take it after all
     snprintf(g_err, sizeof(g_err), "cef_browser_host_create_browser failed");
-    ctx_unref(c);
+    ctx_unref(c); // the transfer CEF did not take
+    ctx_unref(c); // the shim's own reference
     return -1;
   }
   return 0;

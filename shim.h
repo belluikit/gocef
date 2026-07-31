@@ -56,6 +56,20 @@ void gocef_shutdown(void);
 // gocef_error returns the last failure message, or "" if there was none.
 const char *gocef_error(void);
 
+// gocef_counter reports how many times a shim callback has fired, for
+// diagnosing a browser that silently does nothing. A stalled creation with
+// get_view_rect at zero means CEF never consulted the client at all; nonzero
+// counts walk the line to wherever progress stopped.
+enum {
+  GOCEF_N_GET_VIEW_RECT = 0,
+  GOCEF_N_GET_SCREEN_INFO,
+  GOCEF_N_PAINT,
+  GOCEF_N_AFTER_CREATED,
+  GOCEF_N_BEFORE_CLOSE,
+  GOCEF_N_COUNTERS,
+};
+long gocef_counter(int which);
+
 // gocef_compiled_api_version reports the CEF_API_VERSION this shim was built
 // with. The Go constant and the -D flag that reaches the compiler are two
 // declarations of one fact, and Load asserts they agree — a mismatch would

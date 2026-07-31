@@ -30,6 +30,7 @@ type Config struct {
 	HelperPath string
 	CachePath  string
 	Switches   []string
+	LogFile    string
 }
 
 // AcceleratedFrame describes a dma-buf frame.
@@ -86,6 +87,18 @@ func Work() {}
 
 // Shutdown is a no-op without a browser process.
 func Shutdown() {}
+
+// Stats reports how many times each shim callback has fired.
+type Stats struct {
+	ViewRect     int64
+	ScreenInfo   int64
+	Paint        int64
+	AfterCreated int64
+	BeforeClose  int64
+}
+
+// ReadStats reports zeroes on a target with no binding.
+func ReadStats() Stats { return Stats{} }
 
 // ExecuteProcess reports the browser-process sentinel, since no subprocess can
 // be recognised here.

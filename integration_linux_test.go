@@ -154,15 +154,36 @@ func TestCEFRuntime(t *testing.T) {
 		switches = append(switches, "--ozone-platform=headless")
 	}
 
+	// Chromium's own log is the diagnostic for a browser that silently does
+	// nothing; on failure the tail is dumped alongside the callback counters.
+	cefLog := t.TempDir() + "/cef.log"
+
 	if err := gocef.Initialize(gocef.Config{
 		Dir:        dir,
 		HelperPath: dir + "/cef_helper",
 		CachePath:  t.TempDir(),
 		Switches:   switches,
+		LogFile:    cefLog,
 	}); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
 	defer gocef.Shutdown()
+
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		t.Logf("shim callback counters: %+v", gocef.ReadStats())
+		if data, err := os.ReadFile(cefLog); err == nil {
+			const keep = 8000
+			if len(data) > keep {
+				data = data[len(data)-keep:]
+			}
+			t.Logf("CEF log tail:\n%s", data)
+		} else {
+			t.Logf("no CEF log was written (%v)", err)
+		}
+	})
 
 	// A second Initialize must be refused rather than attempted: CEF cannot be
 	// initialized twice in a process and doing so core-dumps.

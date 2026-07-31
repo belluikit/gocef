@@ -123,6 +123,12 @@ type Config struct {
 	// display server, and dma-buf delivery needs
 	// --enable-features=Vulkan --use-vulkan=native (belluikit/bellui#102).
 	Switches []string
+
+	// LogFile, when set, raises CEF's log severity to VERBOSE and writes
+	// Chromium's own logging there — browser, renderer and GPU processes
+	// alike. It is the diagnostic for a browser that silently does nothing,
+	// which Chromium tends to explain only below WARNING.
+	LogFile string
 }
 
 // Initialize starts CEF's browser process.
@@ -156,7 +162,10 @@ func Initialize(cfg Config) error {
 	sw := C.CString(joinSwitches(cfg.Switches))
 	defer C.free(unsafe.Pointer(sw))
 
-	if C.gocef_initialize(res, loc, cache, helper, sw, 60) != 0 {
+	lf := C.CString(cfg.LogFile)
+	defer C.free(unsafe.Pointer(lf))
+
+	if C.gocef_initialize(res, loc, cache, helper, sw, 60, lf) != 0 {
 		return fmt.Errorf("gocef: %s", C.GoString(C.gocef_error()))
 	}
 	started = true
@@ -178,6 +187,29 @@ func joinSwitches(sw []string) string {
 // thread that called Initialize. Callbacks are delivered inside it.
 func Work() {
 	C.gocef_work()
+}
+
+// Stats reports how many times each shim callback has fired, process-wide. Its
+// use is diagnosing a browser that silently does nothing: ViewRect at zero
+// means CEF never consulted the client at all, and nonzero counts walk the
+// line to wherever progress stopped.
+type Stats struct {
+	ViewRect     int64
+	ScreenInfo   int64
+	Paint        int64
+	AfterCreated int64
+	BeforeClose  int64
+}
+
+// ReadStats returns the current callback counts.
+func ReadStats() Stats {
+	return Stats{
+		ViewRect:     int64(C.gocef_counter(C.GOCEF_N_GET_VIEW_RECT)),
+		ScreenInfo:   int64(C.gocef_counter(C.GOCEF_N_GET_SCREEN_INFO)),
+		Paint:        int64(C.gocef_counter(C.GOCEF_N_PAINT)),
+		AfterCreated: int64(C.gocef_counter(C.GOCEF_N_AFTER_CREATED)),
+		BeforeClose:  int64(C.gocef_counter(C.GOCEF_N_BEFORE_CLOSE)),
+	}
 }
 
 // Shutdown stops CEF. Nothing in this package may be used afterwards.
