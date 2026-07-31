@@ -191,10 +191,16 @@ func TestCEFRuntime(t *testing.T) {
 		t.Error("second Initialize succeeded; it must be refused, since CEF is once-per-process")
 	}
 
-	t.Run("frames", func(t *testing.T) { testFrames(t) })
-	t.Run("resize", func(t *testing.T) { testResize(t) })
-	t.Run("hidpi", func(t *testing.T) { testHiDPI(t) })
-	t.Run("two browsers", func(t *testing.T) { testTwoBrowsers(t) })
+	// NOT t.Run. Subtests execute on a fresh goroutine, which lands on some
+	// other OS thread — and every CEF call must come from the thread that
+	// called Initialize. With subtests, create_browser posts its task to the
+	// real UI thread and do_message_loop_work pumps a different one: creation
+	// "succeeds" and then nothing ever happens, with all shim counters at
+	// zero. The probe's thread trap, re-entered through the testing package.
+	testFrames(t)
+	testResize(t)
+	testHiDPI(t)
+	testTwoBrowsers(t)
 }
 
 // pump runs CEF's loop until cond holds. Callbacks are delivered inside Work,
@@ -222,6 +228,7 @@ func closeAndDrain(t *testing.T, b *gocef.Browser, h *handler) {
 }
 
 func testFrames(t *testing.T) {
+	t.Log("--- section: frames")
 	h := newHandler("frames", 400, 300, 1)
 	b, err := gocef.NewBrowser(probePage, 400, 300, false, h)
 	if err != nil {
@@ -256,6 +263,7 @@ func testFrames(t *testing.T) {
 }
 
 func testResize(t *testing.T) {
+	t.Log("--- section: resize")
 	h := newHandler("resize", 320, 240, 1)
 	b, err := gocef.NewBrowser(probePage, 320, 240, false, h)
 	if err != nil {
@@ -287,6 +295,7 @@ func testResize(t *testing.T) {
 // mechanism, and if the scale never reaches the compositor the buffer comes
 // back at 1x and the only symptom on screen is soft text.
 func testHiDPI(t *testing.T) {
+	t.Log("--- section: hidpi")
 	const viewW, viewH = 200, 150
 	h := newHandler("hidpi", viewW, viewH, 2)
 	b, err := gocef.NewBrowser(probePage, viewW, viewH, false, h)
@@ -311,6 +320,7 @@ func testHiDPI(t *testing.T) {
 // with inert refcounts; this is the first thing that would break if the
 // container_of recovery or the refcounting were wrong.
 func testTwoBrowsers(t *testing.T) {
+	t.Log("--- section: two browsers")
 	var hs []*handler
 	var bs []*gocef.Browser
 	for i := range 2 {

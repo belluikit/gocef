@@ -17,7 +17,14 @@
 // Build (see setup.sh):
 //   cc -o cefprobe_helper helper/helper.c -ldl
 
-#define CEF_API_VERSION 15101
+// Supplied by the build (-DCEF_API_VERSION=...), so the helper and the browser
+// process agree on one version. A hardcoded value here silently overrides the
+// flag — the compiler warns "redefined" and then uses this one — which is how
+// the first published helper ended up at a different API version than the
+// binding it shipped with.
+#ifndef CEF_API_VERSION
+#error CEF_API_VERSION must be defined by the build
+#endif
 
 #include <dlfcn.h>
 #include <libgen.h>
