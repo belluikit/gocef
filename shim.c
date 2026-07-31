@@ -22,7 +22,9 @@
 #include "include/capi/cef_devtools_message_observer_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
 #include "include/capi/cef_life_span_handler_capi.h"
+#include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
+#include "include/capi/cef_request_handler_capi.h"
 
 #define MAX_SWITCHES 64
 #define MAX_BROWSERS 64
@@ -57,6 +59,9 @@ static int (*p_create_browser)(const cef_window_info_t *, struct _cef_client_t *
                                struct _cef_dictionary_value_t *,
                                struct _cef_request_context_t *);
 static int (*p_utf8_to_utf16)(const char *, size_t, cef_string_t *);
+static int (*p_utf16_to_utf8)(const char16_t *, size_t, cef_string_utf8_t *);
+static void (*p_utf8_clear)(cef_string_utf8_t *);
+static void (*p_userfree_utf16_free)(cef_string_userfree_utf16_t);
 
 const char *gocef_error(void) { return g_err; }
 
@@ -75,6 +80,30 @@ static void setstr(cef_string_t *dst, const char *src) {
   if (src != NULL && src[0] != '\0') {
     p_utf8_to_utf16(src, strlen(src), dst);
   }
+}
+
+// to_utf8 converts a CEF UTF-16 string for the duration of a callback. The
+// result must be released with utf8_free; a NULL or empty input converts to
+// {NULL, 0}, which the Go side reads as "".
+static cef_string_utf8_t to_utf8(const cef_string_t *s) {
+  cef_string_utf8_t out;
+  memset(&out, 0, sizeof(out));
+  if (s != NULL && s->str != NULL && s->length > 0) {
+    p_utf16_to_utf8(s->str, s->length, &out);
+  }
+  return out;
+}
+
+static void utf8_free(cef_string_utf8_t *s) { p_utf8_clear(s); }
+
+// userfree_to_utf8 is to_utf8 for the strings CEF getters return with
+// ownership — it converts and then frees the original in one step.
+static cef_string_utf8_t userfree_to_utf8(cef_string_userfree_t s) {
+  cef_string_utf8_t out = to_utf8(s);
+  if (s != NULL) {
+    p_userfree_utf16_free(s);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +125,8 @@ typedef struct {
   cef_render_handler_t render;
   cef_life_span_handler_t life;
   cef_display_handler_t display;
+  cef_load_handler_t load;
+  cef_request_handler_t request;
   cef_dev_tools_message_observer_t devtools;
 
   atomic_int refs;
@@ -162,6 +193,8 @@ REFCOUNT_IMPL(client, client)
 REFCOUNT_IMPL(render, render)
 REFCOUNT_IMPL(life, life)
 REFCOUNT_IMPL(display, display)
+REFCOUNT_IMPL(load, load)
+REFCOUNT_IMPL(request, request)
 REFCOUNT_IMPL(devtools, devtools)
 
 // init_base sets the size field CEF reads to tell API versions apart. Getting
@@ -292,7 +325,99 @@ static int CEF_CALLBACK dh_on_cursor_change(struct _cef_display_handler_t *self,
 }
 
 // ---------------------------------------------------------------------------
+// cef_load_handler_t
+//
+// on_loading_state_change is the one complete signal — it fires exactly twice
+// per navigation, before any on_load_start and after every on_load_end or
+// on_load_error — so the start/end pair is not bound at all. The URL is read
+// from the main frame here because the callback itself carries no frame.
+
+static void CEF_CALLBACK lh_on_loading_state_change(
+    struct _cef_load_handler_t *self, struct _cef_browser_t *browser,
+    int isLoading, int canGoBack, int canGoForward) {
+  (void)canGoBack; // queried on demand through gocef_nav, not pushed
+  (void)canGoForward;
+  ctx_t *c = CTX_OF(load, self);
+
+  cef_string_utf8_t url;
+  memset(&url, 0, sizeof(url));
+  cef_frame_t *frame = browser->get_main_frame(browser);
+  if (frame != NULL) {
+    url = userfree_to_utf8(frame->get_url(frame));
+    frame->base.release(&frame->base);
+  }
+  gocefOnLoadingStateChange(c->handle, isLoading, url.str, (int)url.length);
+  utf8_free(&url);
+}
+
+static void CEF_CALLBACK lh_on_load_error(struct _cef_load_handler_t *self,
+                                          struct _cef_browser_t *browser,
+                                          struct _cef_frame_t *frame,
+                                          cef_errorcode_t errorCode,
+                                          const cef_string_t *errorText,
+                                          const cef_string_t *failedUrl) {
+  (void)browser;
+  ctx_t *c = CTX_OF(load, self);
+  int isMain = frame != NULL ? frame->is_main(frame) : 1;
+  cef_string_utf8_t text = to_utf8(errorText);
+  cef_string_utf8_t url = to_utf8(failedUrl);
+  gocefOnLoadError(c->handle, isMain, (int)errorCode, text.str,
+                   (int)text.length, url.str, (int)url.length);
+  utf8_free(&text);
+  utf8_free(&url);
+}
+
+// ---------------------------------------------------------------------------
+// cef_request_handler_t
+
+static int CEF_CALLBACK rq_on_before_browse(struct _cef_request_handler_t *self,
+                                            struct _cef_browser_t *browser,
+                                            struct _cef_frame_t *frame,
+                                            struct _cef_request_t *request,
+                                            int user_gesture, int is_redirect) {
+  (void)browser;
+  ctx_t *c = CTX_OF(request, self);
+  cef_string_utf8_t url = userfree_to_utf8(request->get_url(request));
+  uint32_t transition = (uint32_t)request->get_transition_type(request);
+  int allow = gocefOnBeforeBrowse(c->handle, url.str, (int)url.length,
+                                  transition, frame->is_main(frame),
+                                  user_gesture, is_redirect);
+  utf8_free(&url);
+  return allow ? 0 : 1; // CEF's sense: 1 cancels
+}
+
+// ---------------------------------------------------------------------------
 // cef_life_span_handler_t
+
+static int CEF_CALLBACK ls_on_before_popup(
+    struct _cef_life_span_handler_t *self, struct _cef_browser_t *browser,
+    struct _cef_frame_t *frame, int popup_id, const cef_string_t *target_url,
+    const cef_string_t *target_frame_name,
+    cef_window_open_disposition_t target_disposition, int user_gesture,
+    const cef_popup_features_t *popupFeatures,
+    struct _cef_window_info_t *windowInfo, struct _cef_client_t **client,
+    struct _cef_browser_settings_t *settings,
+    struct _cef_dictionary_value_t **extra_info, int *no_javascript_access) {
+  (void)browser;
+  (void)frame;
+  (void)popup_id;
+  (void)target_frame_name;
+  (void)target_disposition;
+  (void)popupFeatures;
+  (void)windowInfo;
+  (void)client;
+  (void)settings;
+  (void)extra_info;
+  (void)no_javascript_access;
+  ctx_t *c = CTX_OF(life, self);
+  cef_string_utf8_t url = to_utf8(target_url);
+  gocefOnBeforePopup(c->handle, url.str, (int)url.length, user_gesture);
+  utf8_free(&url);
+  // Always cancelled: a windowless browser has nowhere to host a second
+  // window, and letting CEF create one against this client would conflate two
+  // browsers on one handle. See shim.h.
+  return 1;
+}
 
 static void CEF_CALLBACK ls_on_after_created(struct _cef_life_span_handler_t *self,
                                              struct _cef_browser_t *browser) {
@@ -383,6 +508,20 @@ cl_get_display_handler(struct _cef_client_t *self) {
   return &c->display;
 }
 
+static struct _cef_load_handler_t *CEF_CALLBACK
+cl_get_load_handler(struct _cef_client_t *self) {
+  ctx_t *c = CTX_OF(client, self);
+  ctx_ref(c);
+  return &c->load;
+}
+
+static struct _cef_request_handler_t *CEF_CALLBACK
+cl_get_request_handler(struct _cef_client_t *self) {
+  ctx_t *c = CTX_OF(client, self);
+  ctx_ref(c);
+  return &c->request;
+}
+
 // ---------------------------------------------------------------------------
 
 int gocef_load(const char *dir, int apiVersion) {
@@ -404,7 +543,11 @@ int gocef_load(const char *dir, int apiVersion) {
       resolve((void **)&p_shutdown, "cef_shutdown") != 0 ||
       resolve((void **)&p_do_message_loop_work, "cef_do_message_loop_work") != 0 ||
       resolve((void **)&p_create_browser, "cef_browser_host_create_browser") != 0 ||
-      resolve((void **)&p_utf8_to_utf16, "cef_string_utf8_to_utf16") != 0) {
+      resolve((void **)&p_utf8_to_utf16, "cef_string_utf8_to_utf16") != 0 ||
+      resolve((void **)&p_utf16_to_utf8, "cef_string_utf16_to_utf8") != 0 ||
+      resolve((void **)&p_utf8_clear, "cef_string_utf8_clear") != 0 ||
+      resolve((void **)&p_userfree_utf16_free,
+              "cef_string_userfree_utf16_free") != 0) {
     return -1;
   }
 
@@ -519,6 +662,8 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
   c->client.get_render_handler = cl_get_render_handler;
   c->client.get_life_span_handler = cl_get_life_span_handler;
   c->client.get_display_handler = cl_get_display_handler;
+  c->client.get_load_handler = cl_get_load_handler;
+  c->client.get_request_handler = cl_get_request_handler;
 
   init_base(&c->render.base, sizeof(c->render), render_add_ref, render_release,
             render_has_one, render_has_any);
@@ -531,12 +676,22 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
 
   init_base(&c->life.base, sizeof(c->life), life_add_ref, life_release,
             life_has_one, life_has_any);
+  c->life.on_before_popup = ls_on_before_popup;
   c->life.on_after_created = ls_on_after_created;
   c->life.on_before_close = ls_on_before_close;
 
   init_base(&c->display.base, sizeof(c->display), display_add_ref,
             display_release, display_has_one, display_has_any);
   c->display.on_cursor_change = dh_on_cursor_change;
+
+  init_base(&c->load.base, sizeof(c->load), load_add_ref, load_release,
+            load_has_one, load_has_any);
+  c->load.on_loading_state_change = lh_on_loading_state_change;
+  c->load.on_load_error = lh_on_load_error;
+
+  init_base(&c->request.base, sizeof(c->request), request_add_ref,
+            request_release, request_has_one, request_has_any);
+  c->request.on_before_browse = rq_on_before_browse;
 
   init_base(&c->devtools.base, sizeof(c->devtools), devtools_add_ref,
             devtools_release, devtools_has_one, devtools_has_any);

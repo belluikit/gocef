@@ -170,6 +170,38 @@ extern void gocefOnDevToolsMessage(uint64_t handle, void *msg, int n);
 // ---------------------------------------------------------------------------
 // Callbacks into Go. All are called on CEF's browser UI thread, which is the
 // thread that pumps the loop.
+//
+// String parameters are UTF-8 buffers valid only for the duration of the call;
+// a NULL pointer with length 0 is an empty string.
+
+// gocefOnLoadingStateChange reports the browser-wide load state flipping. It
+// fires exactly twice per navigation — loading and then settled — and url is
+// the main frame's URL at that moment.
+extern void gocefOnLoadingStateChange(uint64_t handle, int isLoading,
+                                      void *url, int urlLen);
+
+// gocefOnLoadError reports a navigation that failed or was cancelled.
+// errorCode is a Chromium net error (see net_error_list.h); a cancelled
+// navigation reports ERR_ABORTED (-3).
+extern void gocefOnLoadError(uint64_t handle, int isMainFrame, int errorCode,
+                             void *errorText, int errorTextLen,
+                             void *url, int urlLen);
+
+// gocefOnBeforeBrowse is consulted before a navigation starts. The engine is
+// blocked on the answer. Return nonzero to allow the navigation, 0 to cancel
+// it — note this is the Go sense ("may it proceed?"), inverted from CEF's
+// on_before_browse return value.
+extern int gocefOnBeforeBrowse(uint64_t handle, void *url, int urlLen,
+                               uint32_t transition, int isMainFrame,
+                               int userGesture, int isRedirect);
+
+// gocefOnBeforePopup reports the page asking for a new window — target=_blank
+// or window.open. The popup is always refused on CEF's side: a windowless
+// browser has nowhere to host a second window, and letting CEF create one
+// against this shim's client would conflate two browsers on one handle. The
+// handler decides what becomes of the URL (typically loading it in place).
+extern void gocefOnBeforePopup(uint64_t handle, void *url, int urlLen,
+                               int userGesture);
 
 // gocefOnPaint delivers a CPU frame: BGRA, upper-left origin, w*h*4 bytes,
 // valid only for the duration of the call.

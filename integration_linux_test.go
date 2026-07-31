@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,6 +202,7 @@ func TestCEFRuntime(t *testing.T) {
 	testResize(t)
 	testHiDPI(t)
 	testVisibility(t)
+	testNavigation(t)
 	testTwoBrowsers(t)
 }
 
@@ -361,6 +363,137 @@ func testVisibility(t *testing.T) {
 	resumed := pump(func() bool { return h.frameCount() > before }, 10*time.Second)
 	if !resumed {
 		t.Error("no frame after SetVisible(true) + Invalidate; the browser did not wake")
+	}
+}
+
+// navHandler adds the optional LoadHandler and NavigationHandler capabilities
+// to the base test handler, recording what arrives and refusing whatever the
+// test put in deny.
+type navHandler struct {
+	*handler
+
+	mu      sync.Mutex
+	loads   []loadEvent
+	errors  []loadErrEvent
+	browses []gocef.NavigationEvent
+	deny    string // substring of URLs to refuse; empty refuses nothing
+}
+
+type loadEvent struct {
+	loading bool
+	url     string
+}
+
+type loadErrEvent struct {
+	mainFrame bool
+	code      int
+	text, url string
+}
+
+func (h *navHandler) LoadingStateChanged(loading bool, url string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.loads = append(h.loads, loadEvent{loading: loading, url: url})
+}
+
+func (h *navHandler) LoadError(mainFrame bool, code int, text, url string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.errors = append(h.errors, loadErrEvent{mainFrame: mainFrame, code: code, text: text, url: url})
+}
+
+func (h *navHandler) BeforeBrowse(ev gocef.NavigationEvent) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.browses = append(h.browses, ev)
+	return h.deny == "" || !strings.Contains(ev.URL, h.deny)
+}
+
+func (h *navHandler) BeforePopup(string, bool) {}
+
+// settled matches by substring: Chromium may normalise the URLs it reports,
+// so an exact comparison against what LoadURL was given is not a contract.
+func (h *navHandler) settled(urlPart string) func() bool {
+	return func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, l := range h.loads {
+			if !l.loading && strings.Contains(l.url, urlPart) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func (h *navHandler) sawBrowse(urlPart string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, b := range h.browses {
+		if strings.Contains(b.URL, urlPart) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *navHandler) abortedError(urlPart string) func() bool {
+	return func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, e := range h.errors {
+			if e.mainFrame && e.code == gocef.ErrAborted && strings.Contains(e.url, urlPart) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// testNavigation exercises the load handler and the navigation veto: an
+// allowed navigation must report loading and settling with its URL, and a
+// refused one must never settle — reporting ERR_ABORTED instead, which is the
+// documented consequence of cancelling in on_before_browse.
+func testNavigation(t *testing.T) {
+	t.Log("--- section: navigation")
+	const (
+		pageTwo    = `data:text/html,<body style="background:%230000ff">two`
+		pageDenied = `data:text/html,<body style="background:%23ff0000">denied`
+	)
+
+	h := &navHandler{handler: newHandler("navigation", 320, 240, 1)}
+	b, err := gocef.NewBrowser(probePage, 320, 240, false, h)
+	if err != nil {
+		t.Fatalf("NewBrowser: %v", err)
+	}
+	defer closeAndDrain(t, b, h.handler)
+
+	// The initial load consults the policy like any other navigation.
+	if !pump(h.settled("ff00aa"), 20*time.Second) {
+		t.Fatal("the initial navigation never settled through LoadingStateChanged")
+	}
+	if !h.sawBrowse("ff00aa") {
+		t.Error("BeforeBrowse was not consulted for the initial navigation")
+	}
+
+	b.LoadURL(pageTwo)
+	if !pump(h.settled("two"), 20*time.Second) {
+		t.Error("the allowed navigation to pageTwo never settled")
+	}
+	if !h.sawBrowse("two") {
+		t.Error("BeforeBrowse was not consulted for LoadURL")
+	}
+
+	h.mu.Lock()
+	h.deny = "denied"
+	h.mu.Unlock()
+
+	b.LoadURL(pageDenied)
+	if !pump(h.abortedError("denied"), 20*time.Second) {
+		t.Error("the refused navigation never reported ERR_ABORTED through LoadError")
+	}
+	if pump(h.settled("denied"), 500*time.Millisecond) {
+		t.Error("the refused navigation settled anyway; the veto did not cancel it")
 	}
 }
 

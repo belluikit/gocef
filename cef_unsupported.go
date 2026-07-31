@@ -141,6 +141,44 @@ type DevToolsHandler interface {
 	DevToolsMessage(msg []byte)
 }
 
+// ErrAborted is the Chromium net error code of a cancelled navigation.
+const ErrAborted = -3
+
+// LoadHandler is an optional capability on a Handler: implement it to observe
+// the browser's load progress.
+type LoadHandler interface {
+	LoadingStateChanged(loading bool, url string)
+	LoadError(mainFrame bool, code int, errorText, url string)
+}
+
+// NavigationEvent is a navigation the browser is about to start.
+type NavigationEvent struct {
+	URL         string
+	Transition  uint32
+	MainFrame   bool
+	UserGesture bool
+	Redirect    bool
+}
+
+// Transition source values and flags for NavigationEvent.Transition.
+const (
+	TransitionLink            = 0
+	TransitionExplicit        = 1
+	TransitionAutoSubframe    = 3
+	TransitionManualSubframe  = 4
+	TransitionFormSubmit      = 7
+	TransitionReload          = 8
+	TransitionSourceMask      = 0xFF
+	TransitionForwardBackFlag = 0x01000000
+)
+
+// NavigationHandler is an optional capability on a Handler: implement it to
+// decide navigations before they start.
+type NavigationHandler interface {
+	BeforeBrowse(ev NavigationEvent) bool
+	BeforePopup(url string, userGesture bool)
+}
+
 func (b *Browser) SendMouseMove(int, int, uint32, bool)                         {}
 func (b *Browser) SendMouseClick(int, int, uint32, MouseButton, bool, int)      {}
 func (b *Browser) SendMouseWheel(int, int, uint32, int, int)                    {}
