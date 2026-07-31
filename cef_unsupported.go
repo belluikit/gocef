@@ -26,11 +26,12 @@ var ErrUnsupported = errors.New("gocef: unsupported platform (needs linux and cg
 // Config describes the payload layout and the Chromium command line. It is
 // declared here so cross-platform code can build one unconditionally.
 type Config struct {
-	Dir        string
-	HelperPath string
-	CachePath  string
-	Switches   []string
-	LogFile    string
+	Dir           string
+	HelperPath    string
+	CachePath     string
+	RootCachePath string
+	Switches      []string
+	LogFile       string
 }
 
 // AcceleratedFrame describes a dma-buf frame.
