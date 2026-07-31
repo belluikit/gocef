@@ -332,19 +332,39 @@ static int CEF_CALLBACK dt_on_message(struct _cef_dev_tools_message_observer_t *
 // ---------------------------------------------------------------------------
 // cef_client_t
 
+// The getters below each return an **owned** reference, so every one adds a
+// reference before returning.
+//
+// This is the C API's ownership rule and it is not written in the headers.
+// CEF's own generated wrapper is the statement of it: client_cpptoc.cc ends
+// get_render_handler with `return CefRenderHandlerCppToC_Wrap(_retval)`, and
+// Wrap hands out a reference the caller owns. CEF releases what it is given,
+// so a getter that returns a bare pointer lets the count fall below the number
+// of outstanding users — the context is freed while CEF is still calling into
+// it, and the next callback dereferences freed memory.
+//
+// It presents as a segmentation fault during the first browser's first frames,
+// which says nothing at all about reference counting.
+
 static struct _cef_render_handler_t *CEF_CALLBACK
 cl_get_render_handler(struct _cef_client_t *self) {
-  return &CTX_OF(client, self)->render;
+  ctx_t *c = CTX_OF(client, self);
+  ctx_ref(c);
+  return &c->render;
 }
 
 static struct _cef_life_span_handler_t *CEF_CALLBACK
 cl_get_life_span_handler(struct _cef_client_t *self) {
-  return &CTX_OF(client, self)->life;
+  ctx_t *c = CTX_OF(client, self);
+  ctx_ref(c);
+  return &c->life;
 }
 
 static struct _cef_display_handler_t *CEF_CALLBACK
 cl_get_display_handler(struct _cef_client_t *self) {
-  return &CTX_OF(client, self)->display;
+  ctx_t *c = CTX_OF(client, self);
+  ctx_ref(c);
+  return &c->display;
 }
 
 // ---------------------------------------------------------------------------
@@ -464,8 +484,10 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
     return -1;
   }
   c->handle = handle;
-  // One reference for the shim itself; CEF adds its own as it takes the
-  // handlers.
+  // One reference for the shim itself, released by gocef_close_browser. A
+  // second is added below for the client passed into create_browser, because
+  // arguments are transferred the same way return values are: CEF takes
+  // ownership of what it is handed and releases it when done.
   atomic_init(&c->refs, 1);
 
   init_base(&c->client.base, sizeof(c->client), client_add_ref, client_release,
@@ -517,7 +539,11 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
   memset(&curl, 0, sizeof(curl));
   setstr(&curl, url);
 
+  // The reference transferred to CEF with the client.
+  ctx_ref(c);
+
   if (p_create_browser(&wi, &c->client, &curl, &bs, NULL, NULL) != 1) {
+    ctx_unref(c); // CEF did not take it after all
     snprintf(g_err, sizeof(g_err), "cef_browser_host_create_browser failed");
     ctx_unref(c);
     return -1;
