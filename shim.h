@@ -40,9 +40,13 @@ int gocef_load(const char *dir, int apiVersion);
 // argv, which Chromium propagates to the subprocesses it launches.
 //
 // Must be called from the thread that will pump the message loop.
+// logFile, when non-empty, raises CEF's log severity to VERBOSE and writes
+// Chromium's own logging there — the diagnostic for a browser that silently
+// does nothing.
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
                      const char *cachePath, const char *helperPath,
-                     const char *switches, int windowlessFrameRate);
+                     const char *switches, int windowlessFrameRate,
+                     const char *logFile);
 
 // gocef_work runs one iteration of CEF's message loop. It must be called from
 // the same thread that called gocef_initialize — CEF's browser UI thread.
