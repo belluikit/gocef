@@ -131,6 +131,11 @@ func (h *handler) wasClosed() bool {
 }
 
 func TestCEFRuntime(t *testing.T) {
+	if os.Getenv("GOCEF_EXTERNAL_PUMP") == "1" {
+		// CEF is once-per-process; this process belongs to
+		// TestCEFRuntimeExternalPump's configuration.
+		t.Skip("GOCEF_EXTERNAL_PUMP=1 selects the external-pump leg")
+	}
 	dir := os.Getenv("GOCEF_PAYLOAD")
 	if dir == "" {
 		t.Skip("GOCEF_PAYLOAD is unset; see the workflow for how the payload is staged")
@@ -727,4 +732,147 @@ func testIME(t *testing.T) {
 	if h.boundsSeen() == 0 {
 		t.Error("ImeCompositionRangeChanged never reported character bounds")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// External message pump (belluikit/bellui#120).
+
+// TestCEFRuntimeExternalPump is the second per-process configuration: CEF is
+// once-per-process, so the external-pump initialization cannot share a
+// process with TestCEFRuntime. The GOCEF_EXTERNAL_PUMP env selects which of
+// the two runs; CI runs the binary twice.
+func TestCEFRuntimeExternalPump(t *testing.T) {
+	if os.Getenv("GOCEF_EXTERNAL_PUMP") != "1" {
+		t.Skip("GOCEF_EXTERNAL_PUMP is unset; this is the env-on leg")
+	}
+	dir := os.Getenv("GOCEF_PAYLOAD")
+	if dir == "" {
+		t.Skip("GOCEF_PAYLOAD is unset; see the workflow for how the payload is staged")
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := gocef.Load(dir); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	switches := []string{"--no-sandbox"}
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		switches = append(switches, "--ozone-platform=headless")
+	}
+
+	// The scheduler only signals: requests land in a buffered channel the
+	// pump loop below drains, implementing CEF's replace-pending contract.
+	sched := make(chan int64, 256)
+	scheduled := 0
+	if err := gocef.Initialize(gocef.Config{
+		Dir:        dir,
+		HelperPath: dir + "/cef_helper",
+		CachePath:  t.TempDir(),
+		Switches:   switches,
+		PumpScheduler: func(delayMS int64) {
+			select {
+			case sched <- delayMS:
+			default: // a full queue means a wakeup is already due
+			}
+		},
+	}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	defer gocef.Shutdown()
+
+	// pumpScheduled drives Work ONLY from schedule requests, plus a slow
+	// 250 ms safety tick (CEF documents under-scheduling around nested
+	// loops). It reports how many Work calls each source caused, so the
+	// assertion below can prove the scheduler was the engine.
+	fallback := 0
+	pumpScheduled := func(cond func() bool, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		timer := time.NewTimer(0) // one initial Work to get things moving
+		defer timer.Stop()
+		for time.Now().Before(deadline) {
+			select {
+			case d := <-sched:
+				scheduled++
+				if d <= 0 {
+					d = 1
+				}
+				timer.Reset(time.Duration(d) * time.Millisecond)
+			case <-timer.C:
+				gocef.Work()
+				if cond() {
+					return true
+				}
+			case <-time.After(250 * time.Millisecond):
+				fallback++
+				gocef.Work()
+				if cond() {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// A page whose own timers run faster than any frame rate: if the pump
+	// only turned when a caller felt like it, this counter would crawl.
+	const pumpPage = `data:text/html,<body style="background:%23ff00aa">` +
+		`<script>window.n=0;(function tick(){window.n++;setTimeout(tick,5)})()</script>`
+
+	h := &imeTestHandler{handler: newHandler("extpump", 320, 240, 1)}
+	b, err := gocef.NewBrowser(pumpPage, 320, 240, false, h)
+	if err != nil {
+		t.Fatalf("NewBrowser: %v", err)
+	}
+	defer func() {
+		b.Close()
+		if !pumpScheduled(h.wasClosed, 10*time.Second) {
+			t.Error("Closed callback never fired after Close")
+		}
+	}()
+
+	if !pumpScheduled(func() bool { _, got := h.lastFrame(); return got }, 30*time.Second) {
+		t.Fatalf("no frame arrived under the external pump (scheduled=%d fallback=%d)", scheduled, fallback)
+	}
+
+	// evalPumped mirrors evalJS but drives the scheduled loop.
+	evalPumped := func(expr string) string {
+		t.Helper()
+		imeEvalID++
+		id := imeEvalID
+		msg := fmt.Sprintf(`{"id":%d,"method":"Runtime.evaluate","params":{"expression":%q,"returnByValue":true}}`, id, expr)
+		if !b.SendDevTools([]byte(msg)) {
+			t.Fatalf("SendDevTools refused %s", msg)
+		}
+		var out json.RawMessage
+		if !pumpScheduled(func() bool { v, ok := h.reply(id); out = v; return ok }, 10*time.Second) {
+			t.Fatalf("no CDP reply for %s", expr)
+		}
+		var s string
+		if json.Unmarshal(out, &s) == nil {
+			return s
+		}
+		return string(out)
+	}
+
+	n0 := evalPumped("window.n")
+	if !pumpScheduled(func() bool { return false }, 1*time.Second) {
+		_ = 0 // the 1 s window elapsing is the point, not the cond
+	}
+	n1 := evalPumped("window.n")
+
+	var v0, v1 int
+	fmt.Sscanf(n0, "%d", &v0)
+	fmt.Sscanf(n1, "%d", &v1)
+	if v1-v0 < 20 {
+		t.Errorf("page timers crawled under the external pump: n went %d -> %d in ~1s (scheduled=%d fallback=%d)", v0, v1, scheduled, fallback)
+	}
+	if scheduled == 0 {
+		t.Error("OnScheduleMessagePumpWork never fired; the external pump is not installed")
+	}
+	if fallback > scheduled {
+		t.Errorf("the safety tick outran the scheduler (scheduled=%d fallback=%d) — CEF is not asking for work", scheduled, fallback)
+	}
+	t.Logf("external pump: scheduled=%d fallback=%d page timer %d -> %d", scheduled, fallback, v0, v1)
 }

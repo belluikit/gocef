@@ -33,6 +33,7 @@ type Config struct {
 	Switches      []string
 	LogFile       string
 	SandboxPath   string
+	PumpScheduler func(delayMS int64)
 }
 
 // AcceleratedFrame describes a dma-buf frame.

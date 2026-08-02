@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -160,6 +161,34 @@ type Config struct {
 	// an error, which is why enabling it is opt-in and pre-verified, never
 	// guessed.
 	SandboxPath string
+
+	// PumpScheduler, when non-nil, enables CEF's external message pump
+	// (cef_settings_t.external_message_pump) and installs a process-level
+	// cef_app_t whose browser-process handler forwards
+	// OnScheduleMessagePumpWork here. CEF then ASKS for Work instead of
+	// depending on a fixed-rate caller: delayMS <= 0 means call Work
+	// reasonably soon; > 0 means call it after that many milliseconds,
+	// REPLACING any previously requested delay (CEF's documented contract).
+	//
+	// The callback fires from arbitrary CEF threads. It must only signal a
+	// scheduler — a channel send, a timer reset — and return: no CEF calls,
+	// no blocking. Work itself must still come from the Initialize thread.
+	//
+	// Nil (the default) preserves the caller-timed pump exactly: the same
+	// NULL-app cef_initialize as before, byte for byte.
+	PumpScheduler func(delayMS int64)
+}
+
+// pumpScheduler holds Config.PumpScheduler for the process. Written once
+// under mu before cef_initialize runs; read lock-free by the export below,
+// which arbitrary CEF threads call.
+var pumpScheduler atomic.Pointer[func(int64)]
+
+//export gocefOnScheduleMessagePumpWork
+func gocefOnScheduleMessagePumpWork(delayMS C.int64_t) {
+	if f := pumpScheduler.Load(); f != nil {
+		(*f)(int64(delayMS))
+	}
 }
 
 // Initialize starts CEF's browser process.
@@ -209,7 +238,16 @@ func Initialize(cfg Config) error {
 		enableSandbox = 1
 	}
 
-	if C.gocef_initialize(res, loc, cache, rootCache, helper, sw, 60, lf, enableSandbox) != 0 {
+	externalPump := C.int(0)
+	if cfg.PumpScheduler != nil {
+		// Stored before cef_initialize: the first schedule request can fire
+		// during initialization, from a CEF thread.
+		f := cfg.PumpScheduler
+		pumpScheduler.Store(&f)
+		externalPump = 1
+	}
+
+	if C.gocef_initialize(res, loc, cache, rootCache, helper, sw, 60, lf, enableSandbox, externalPump) != 0 {
 		return fmt.Errorf("gocef: %s", C.GoString(C.gocef_error()))
 	}
 	started = true
