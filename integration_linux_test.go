@@ -3,6 +3,7 @@
 package gocef_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
@@ -205,6 +206,7 @@ func TestCEFRuntime(t *testing.T) {
 	testHiDPI(t)
 	testVisibility(t)
 	testNavigation(t)
+	testIME(t)
 	testTwoBrowsers(t)
 }
 
@@ -566,5 +568,163 @@ func testTwoBrowsers(t *testing.T) {
 
 	for i := range bs {
 		closeAndDrain(t, bs[i], hs[i])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IME composition (belluikit/bellui#121).
+
+// imeTestHandler adds the two optional capabilities testIME needs: a CDP
+// channel to read page state back, and the composition-range reports.
+type imeTestHandler struct {
+	*handler
+	imu     sync.Mutex
+	replies map[int]json.RawMessage
+	ranges  []gocef.Range
+	bounds  int // rects seen across all reports
+}
+
+func (h *imeTestHandler) DevToolsMessage(msg []byte) {
+	var m struct {
+		ID     int `json:"id"`
+		Result struct {
+			Result struct {
+				Value json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(msg, &m) != nil || m.ID == 0 {
+		return
+	}
+	h.imu.Lock()
+	defer h.imu.Unlock()
+	if h.replies == nil {
+		h.replies = make(map[int]json.RawMessage)
+	}
+	h.replies[m.ID] = m.Result.Result.Value
+}
+
+func (h *imeTestHandler) ImeCompositionRangeChanged(sel gocef.Range, bounds []gocef.Rect) {
+	h.imu.Lock()
+	defer h.imu.Unlock()
+	h.ranges = append(h.ranges, sel)
+	h.bounds += len(bounds)
+}
+
+func (h *imeTestHandler) reply(id int) (json.RawMessage, bool) {
+	h.imu.Lock()
+	defer h.imu.Unlock()
+	v, ok := h.replies[id]
+	return v, ok
+}
+
+func (h *imeTestHandler) boundsSeen() int {
+	h.imu.Lock()
+	defer h.imu.Unlock()
+	return h.bounds
+}
+
+var imeEvalID = 100
+
+// evalJS evaluates expr in the page and returns the JSON-encoded value.
+func evalJS(t *testing.T, b *gocef.Browser, h *imeTestHandler, expr string) string {
+	t.Helper()
+	imeEvalID++
+	id := imeEvalID
+	msg := fmt.Sprintf(`{"id":%d,"method":"Runtime.evaluate","params":{"expression":%q,"returnByValue":true}}`, id, expr)
+	if !b.SendDevTools([]byte(msg)) {
+		t.Fatalf("SendDevTools refused %s", msg)
+	}
+	var out json.RawMessage
+	if !pump(func() bool { v, ok := h.reply(id); out = v; return ok }, 10*time.Second) {
+		t.Fatalf("no CDP reply for %s", expr)
+	}
+	// CDP escapes non-ASCII in its JSON (に…); decode string values so
+	// callers compare plain Go strings. Non-strings come back as raw JSON.
+	var s string
+	if json.Unmarshal(out, &s) == nil {
+		return s
+	}
+	return string(out)
+}
+
+func testIME(t *testing.T) {
+	t.Log("--- section: IME composition")
+
+	// The page records every composition event; the input autofocuses so the
+	// composition has a target node.
+	const imePage = `data:text/html,<input id="t" autofocus>` +
+		`<script>window.ev=[];` +
+		`['compositionstart','compositionupdate','compositionend'].forEach(function(n){` +
+		`document.getElementById('t').addEventListener(n,function(e){window.ev.push(n)});});` +
+		`</script>`
+
+	h := &imeTestHandler{handler: newHandler("ime", 320, 240, 1)}
+	b, err := gocef.NewBrowser(imePage, 320, 240, false, h)
+	if err != nil {
+		t.Fatalf("NewBrowser: %v", err)
+	}
+	defer closeAndDrain(t, b, h.handler)
+
+	if !pump(func() bool { _, got := h.lastFrame(); return got }, 20*time.Second) {
+		t.Fatal("the IME page never painted")
+	}
+	b.SetFocus(true)
+	if !pump(func() bool {
+		return evalJS(t, b, h, "document.activeElement.id") == "t"
+	}, 10*time.Second) {
+		t.Fatal("the input never took focus")
+	}
+
+	// Composition appears in the input's value without committing.
+	b.ImeSetComposition("にほ", 2, nil)
+	if !pump(func() bool {
+		return evalJS(t, b, h, "document.getElementById('t').value") == "にほ"
+	}, 10*time.Second) {
+		t.Error("the composition text never reached the input's value")
+	}
+
+	// Commit replaces the composition contents.
+	b.ImeCommitText("日本")
+	if !pump(func() bool {
+		return evalJS(t, b, h, "document.getElementById('t').value") == "日本"
+	}, 10*time.Second) {
+		t.Error("the committed text never replaced the composition")
+	}
+	if !pump(func() bool {
+		return evalJS(t, b, h, "window.ev.indexOf('compositionend')>=0") == "true"
+	}, 5*time.Second) {
+		t.Error("no compositionend event was seen by the page")
+	}
+
+	// Cancel discards without applying.
+	b.ImeSetComposition("x", 1, nil)
+	pump(func() bool {
+		return evalJS(t, b, h, "document.getElementById('t').value") == "日本x"
+	}, 10*time.Second)
+	b.ImeCancelComposition()
+	if !pump(func() bool {
+		return evalJS(t, b, h, "document.getElementById('t').value") == "日本"
+	}, 10*time.Second) {
+		t.Error("the cancelled composition was applied instead of discarded")
+	}
+
+	// Finish commits the composition contents as they stand.
+	b.ImeSetComposition("かな", 2, nil)
+	pump(func() bool {
+		return evalJS(t, b, h, "document.getElementById('t').value") == "日本かな"
+	}, 10*time.Second)
+	b.ImeFinishComposingText(false)
+	if !pump(func() bool {
+		return evalJS(t, b, h, "document.getElementById('t').value") == "日本かな" &&
+			evalJS(t, b, h, "window.ev.filter(function(n){return n==='compositionend'}).length>=2") == "true"
+	}, 10*time.Second) {
+		t.Error("FinishComposingText did not commit the composition as it stood")
+	}
+
+	// The composition-range seam fired with real character bounds at least
+	// once while a composition was active (the candidate-window anchor).
+	if h.boundsSeen() == 0 {
+		t.Error("ImeCompositionRangeChanged never reported character bounds")
 	}
 }

@@ -335,6 +335,107 @@ func (b *Browser) SendKey(t KeyEventType, modifiers uint32, windowsKeyCode, nati
 		C.uint16_t(unmodifiedChar), cbool(systemKey))
 }
 
+// Range is a range in UTF-16 code units — cef_range_t's unit. A caller
+// holding rune indices converts before crossing.
+type Range struct {
+	From, To int
+}
+
+// Rect is a rectangle in view coordinates (DIP — the same space as input
+// events and GetViewRect).
+type Rect struct {
+	X, Y, Width, Height int
+}
+
+// CompositionUnderline styles one segment of the composition text. Range is
+// in UTF-16 code units into the composition string; Thick asks for the
+// heavier underline IMEs use to mark the active clause.
+type CompositionUnderline struct {
+	Range Range
+	Thick bool
+}
+
+// ImeSetComposition sets or replaces the in-progress composition (windowless
+// IME). text is the full preedit string; cursor places the caret within it,
+// in UTF-16 code units. A nil underlines slice draws one solid underline
+// across the whole text — what every reference client sends.
+func (b *Browser) ImeSetComposition(text string, cursor int, underlines []CompositionUnderline) {
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+
+	var fromP, toP *C.uint32_t
+	var thickP *C.int
+	if n := len(underlines); n > 0 {
+		from := make([]C.uint32_t, n)
+		to := make([]C.uint32_t, n)
+		thick := make([]C.int, n)
+		for i, ul := range underlines {
+			from[i] = C.uint32_t(ul.Range.From)
+			to[i] = C.uint32_t(ul.Range.To)
+			if ul.Thick {
+				thick[i] = 1
+			}
+		}
+		fromP, toP, thickP = &from[0], &to[0], &thick[0]
+	}
+	C.gocef_ime_set_composition(C.uint64_t(b.id), ctext, C.int(cursor),
+		fromP, toP, thickP, C.int(len(underlines)))
+}
+
+// ImeCommitText completes any active composition by inserting text; with no
+// composition active it inserts the text as if typed. This is also the route
+// for astral-plane runes, which cannot cross as single UTF-16 key events.
+func (b *Browser) ImeCommitText(text string) {
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+	C.gocef_ime_commit_text(C.uint64_t(b.id), ctext)
+}
+
+// ImeFinishComposingText commits the current composition contents as they
+// stand. keepSelection preserves the selection instead of collapsing it.
+func (b *Browser) ImeFinishComposingText(keepSelection bool) {
+	C.gocef_ime_finish_composing_text(C.uint64_t(b.id), cbool(keepSelection))
+}
+
+// ImeCancelComposition discards the in-progress composition without applying
+// it.
+func (b *Browser) ImeCancelComposition() {
+	C.gocef_ime_cancel_composition(C.uint64_t(b.id))
+}
+
+// ImeHandler is an optional capability: a Handler that also implements it
+// receives composition-range reports while a composition is active —
+// the seam for positioning an IME candidate window near the caret.
+type ImeHandler interface {
+	// ImeCompositionRangeChanged reports the composition's selected range
+	// (UTF-16 units) and per-character bounds in view coordinates (DIP).
+	// Called on the browser UI thread, inside Work().
+	ImeCompositionRangeChanged(sel Range, bounds []Rect)
+}
+
+//export gocefOnImeCompositionRange
+func gocefOnImeCompositionRange(handle C.uint64_t, from, to C.uint32_t, bounds *C.int, n C.int) {
+	b := lookup(handle)
+	if b == nil {
+		return
+	}
+	h, ok := b.handler.(ImeHandler)
+	if !ok {
+		return
+	}
+	rects := make([]Rect, int(n))
+	if n > 0 {
+		quads := unsafe.Slice(bounds, int(n)*4)
+		for i := range rects {
+			rects[i] = Rect{
+				X: int(quads[4*i]), Y: int(quads[4*i+1]),
+				Width: int(quads[4*i+2]), Height: int(quads[4*i+3]),
+			}
+		}
+	}
+	h.ImeCompositionRangeChanged(Range{From: int(from), To: int(to)}, rects)
+}
+
 // CanGoBack reports whether there is history to go back to.
 func (b *Browser) CanGoBack() bool {
 	return C.gocef_nav(C.uint64_t(b.id), C.GOCEF_NAV_CAN_GO_BACK) != 0

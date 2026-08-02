@@ -164,6 +164,31 @@ void gocef_send_key(uint64_t handle, int keyType, uint32_t modifiers,
                     uint16_t unmodifiedCharacter, int isSystemKey);
 
 // ---------------------------------------------------------------------------
+// IME composition (windowless only). Every range and cursor position is in
+// UTF-16 code units into the composition text — cef_range_t's own unit; a
+// caller holding rune indices converts first.
+
+// gocef_ime_set_composition sets or replaces the in-progress composition.
+// text is UTF-8; cursor16 places the caret within it. Underlines arrive as
+// parallel arrays of n from/to ranges with a thick flag each; n == 0 draws
+// one solid underline spanning the whole text, which is what every reference
+// client sends.
+void gocef_ime_set_composition(uint64_t handle, const char *text, int cursor16,
+                               const uint32_t *ulFrom, const uint32_t *ulTo,
+                               const int *ulThick, int n);
+
+// gocef_ime_commit_text completes any active composition by inserting text
+// (plain insertion when none is active).
+void gocef_ime_commit_text(uint64_t handle, const char *text);
+
+// gocef_ime_finish_composing_text commits the current composition contents
+// as they stand.
+void gocef_ime_finish_composing_text(uint64_t handle, int keepSelection);
+
+// gocef_ime_cancel_composition discards the composition without applying it.
+void gocef_ime_cancel_composition(uint64_t handle);
+
+// ---------------------------------------------------------------------------
 // DevTools protocol.
 //
 // This is the whole bridge surface: raw UTF-8 JSON in and out. CEF's other
@@ -177,6 +202,14 @@ int gocef_send_devtools(uint64_t handle, const void *msg, size_t n);
 // gocefOnDevToolsMessage delivers a protocol message: a result for one of our
 // calls, or an event. The buffer is valid only for the duration of the call.
 extern void gocefOnDevToolsMessage(uint64_t handle, void *msg, int n);
+
+// gocefOnImeCompositionRange reports, while a composition is active, its
+// selected range (UTF-16 units) and the flattened per-character bounds —
+// x,y,w,h quads in view coordinates (DIP), n quads of 4 ints each, valid only
+// for the duration of the call. Called on CEF's browser UI thread.
+// (bounds is morally const; cgo cannot export a const-qualified pointer.)
+extern void gocefOnImeCompositionRange(uint64_t handle, uint32_t from,
+                                       uint32_t to, int *bounds, int n);
 
 // ---------------------------------------------------------------------------
 // Callbacks into Go. All are called on CEF's browser UI thread, which is the

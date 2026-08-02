@@ -181,10 +181,36 @@ type NavigationHandler interface {
 	BeforePopup(url string, userGesture bool)
 }
 
+// Range is a range in UTF-16 code units.
+type Range struct {
+	From, To int
+}
+
+// Rect is a rectangle in view coordinates (DIP).
+type Rect struct {
+	X, Y, Width, Height int
+}
+
+// CompositionUnderline styles one segment of the composition text.
+type CompositionUnderline struct {
+	Range Range
+	Thick bool
+}
+
+// ImeHandler is an optional capability on a Handler: implement it to receive
+// composition-range reports while an IME composition is active.
+type ImeHandler interface {
+	ImeCompositionRangeChanged(sel Range, bounds []Rect)
+}
+
 func (b *Browser) SendMouseMove(int, int, uint32, bool)                         {}
 func (b *Browser) SendMouseClick(int, int, uint32, MouseButton, bool, int)      {}
 func (b *Browser) SendMouseWheel(int, int, uint32, int, int)                    {}
 func (b *Browser) SendKey(KeyEventType, uint32, int, int, uint16, uint16, bool) {}
+func (b *Browser) ImeSetComposition(string, int, []CompositionUnderline)        {}
+func (b *Browser) ImeCommitText(string)                                         {}
+func (b *Browser) ImeFinishComposingText(bool)                                  {}
+func (b *Browser) ImeCancelComposition()                                        {}
 func (b *Browser) CanGoBack() bool                                              { return false }
 func (b *Browser) CanGoForward() bool                                           { return false }
 func (b *Browser) GoBack()                                                      {}
