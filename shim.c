@@ -82,6 +82,16 @@ static void setstr(cef_string_t *dst, const char *src) {
   }
 }
 
+// clearstr frees the UTF-16 buffer setstr allocated (what cef_string_clear
+// does, without needing the extra symbol). The IME calls run per keystroke,
+// where an unfreed conversion would actually add up.
+static void clearstr(cef_string_t *s) {
+  if (s->dtor != NULL && s->str != NULL) {
+    s->dtor(s->str);
+  }
+  memset(s, 0, sizeof(*s));
+}
+
 // to_utf8 converts a CEF UTF-16 string for the duration of a callback. The
 // result must be released with utf8_free; a NULL or empty input converts to
 // {NULL, 0}, which the Go side reads as "".
@@ -255,6 +265,21 @@ static int CEF_CALLBACK rh_get_screen_info(struct _cef_render_handler_t *self,
   info->available_rect = info->rect;
 
   return 1; // the structure was filled in
+}
+
+static void CEF_CALLBACK rh_on_ime_composition_range_changed(
+    struct _cef_render_handler_t *self, struct _cef_browser_t *browser,
+    const cef_range_t *selected_range, size_t character_boundsCount,
+    cef_rect_t const *character_bounds) {
+  (void)browser;
+  ctx_t *c = CTX_OF(render, self);
+  // cef_rect_t is four ints; the array crosses to Go as flat x,y,w,h quads
+  // with no copy. The assert keeps that cast honest against an ABI change.
+  _Static_assert(sizeof(cef_rect_t) == 4 * sizeof(int),
+                 "cef_rect_t is expected to be four ints");
+  gocefOnImeCompositionRange(c->handle, selected_range->from,
+                             selected_range->to, (int *)character_bounds,
+                             (int)character_boundsCount);
 }
 
 static void CEF_CALLBACK rh_on_paint(struct _cef_render_handler_t *self,
@@ -684,6 +709,8 @@ int gocef_create_browser(uint64_t handle, const char *url, int w, int h,
   c->render.on_accelerated_paint = rh_on_accelerated_paint;
   c->render.on_popup_show = rh_on_popup_show;
   c->render.on_popup_size = rh_on_popup_size;
+  c->render.on_ime_composition_range_changed =
+      rh_on_ime_composition_range_changed;
 
   init_base(&c->life.base, sizeof(c->life), life_add_ref, life_release,
             life_has_one, life_has_any);
@@ -912,6 +939,96 @@ void gocef_send_key(uint64_t handle, int keyType, uint32_t modifiers,
   ev.unmodified_character = (char16_t)unmodifiedCharacter;
   ev.is_system_key = isSystemKey;
   host->send_key_event(host, &ev);
+  host->base.release(&host->base);
+}
+
+// ---------------------------------------------------------------------------
+// IME composition. See shim.h for the UTF-16 unit contract.
+
+void gocef_ime_set_composition(uint64_t handle, const char *text, int cursor16,
+                               const uint32_t *ulFrom, const uint32_t *ulTo,
+                               const int *ulThick, int n) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+
+  cef_string_t ctext;
+  memset(&ctext, 0, sizeof ctext);
+  setstr(&ctext, text);
+
+  // Explicit underline segments, or — the reference-client default — one
+  // solid underline spanning the whole text. Colors stay 0 so Blink picks
+  // its own; size must be set per element (the versioned-struct rule).
+  enum { STACK_ULS = 8 };
+  cef_composition_underline_t stackUls[STACK_ULS];
+  cef_composition_underline_t *uls = stackUls;
+  size_t count = 0;
+  if (n > 0) {
+    if (n > STACK_ULS) {
+      uls = calloc((size_t)n, sizeof(*uls));
+    }
+    for (int i = 0; i < n; i++) {
+      memset(&uls[i], 0, sizeof(uls[i]));
+      uls[i].size = sizeof(uls[i]);
+      uls[i].range.from = ulFrom[i];
+      uls[i].range.to = ulTo[i];
+      uls[i].style = CEF_CUS_SOLID;
+      uls[i].thick = ulThick[i] ? 1 : 0;
+    }
+    count = (size_t)n;
+  } else if (ctext.length > 0) {
+    memset(&stackUls[0], 0, sizeof(stackUls[0]));
+    stackUls[0].size = sizeof(stackUls[0]);
+    stackUls[0].range.from = 0;
+    stackUls[0].range.to = (uint32_t)ctext.length;
+    stackUls[0].style = CEF_CUS_SOLID;
+    count = 1;
+  }
+
+  // An invalid replacement range means "do not replace" (the cefclient
+  // convention); the selection collapses to the caret.
+  cef_range_t replacement = {UINT32_MAX, UINT32_MAX};
+  cef_range_t selection = {(uint32_t)cursor16, (uint32_t)cursor16};
+  host->ime_set_composition(host, &ctext, count, count > 0 ? uls : NULL,
+                            &replacement, &selection);
+
+  if (uls != stackUls) {
+    free(uls);
+  }
+  clearstr(&ctext);
+  host->base.release(&host->base);
+}
+
+void gocef_ime_commit_text(uint64_t handle, const char *text) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  cef_string_t ctext;
+  memset(&ctext, 0, sizeof ctext);
+  setstr(&ctext, text);
+  cef_range_t replacement = {UINT32_MAX, UINT32_MAX};
+  host->ime_commit_text(host, &ctext, &replacement, 0);
+  clearstr(&ctext);
+  host->base.release(&host->base);
+}
+
+void gocef_ime_finish_composing_text(uint64_t handle, int keepSelection) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  host->ime_finish_composing_text(host, keepSelection);
+  host->base.release(&host->base);
+}
+
+void gocef_ime_cancel_composition(uint64_t handle) {
+  cef_browser_host_t *host = host_of(handle);
+  if (host == NULL) {
+    return;
+  }
+  host->ime_cancel_composition(host);
   host->base.release(&host->base);
 }
 
