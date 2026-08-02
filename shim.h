@@ -50,10 +50,14 @@ int gocef_load(const char *dir, int apiVersion);
 // logFile, when non-empty, raises CEF's log severity to VERBOSE and writes
 // Chromium's own logging there — the diagnostic for a browser that silently
 // does nothing.
+// enableSandbox selects Chromium's Linux sandbox; the caller must have
+// verified a usable SUID helper first (see Config.SandboxPath), because with
+// no usable sandbox Chromium aborts the process instead of failing the call.
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
                      const char *cachePath, const char *rootCachePath,
                      const char *helperPath, const char *switches,
-                     int windowlessFrameRate, const char *logFile);
+                     int windowlessFrameRate, const char *logFile,
+                     int enableSandbox);
 
 // gocef_work runs one iteration of CEF's message loop. It must be called from
 // the same thread that called gocef_initialize — CEF's browser UI thread.

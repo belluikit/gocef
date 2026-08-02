@@ -572,7 +572,8 @@ int gocef_execute_process(int argc, char **argv) {
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
                      const char *cachePath, const char *rootCachePath,
                      const char *helperPath, const char *switches,
-                     int windowlessFrameRate, const char *logFile) {
+                     int windowlessFrameRate, const char *logFile,
+                     int enableSandbox) {
   (void)windowlessFrameRate; // per-browser, applied in gocef_create_browser
 
   static char *argv[MAX_SWITCHES + 1];
@@ -596,7 +597,10 @@ int gocef_initialize(const char *resourcesDir, const char *localesDir,
   cef_settings_t settings;
   memset(&settings, 0, sizeof(settings));
   settings.size = sizeof(settings);
-  settings.no_sandbox = 1;
+  // The Go side has already verified the SUID helper and exported
+  // CHROME_DEVEL_SANDBOX when it asks for the sandbox; an unverified enable
+  // is a process abort, not an error (see shim.h).
+  settings.no_sandbox = enableSandbox ? 0 : 1;
   settings.windowless_rendering_enabled = 1;
   settings.log_severity = LOGSEVERITY_WARNING;
   if (logFile != NULL && logFile[0] != '\0') {

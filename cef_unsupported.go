@@ -32,6 +32,7 @@ type Config struct {
 	RootCachePath string
 	Switches      []string
 	LogFile       string
+	SandboxPath   string
 }
 
 // AcceleratedFrame describes a dma-buf frame.

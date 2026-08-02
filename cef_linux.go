@@ -145,6 +145,21 @@ type Config struct {
 	// alike. It is the diagnostic for a browser that silently does nothing,
 	// which Chromium tends to explain only below WARNING.
 	LogFile string
+
+	// SandboxPath enables Chromium's Linux sandbox. Empty — the default —
+	// disables it (cef_settings_t.no_sandbox), today's behaviour. Non-empty
+	// must name a chrome-sandbox binary owned by root with the setuid bit;
+	// it is exported as CHROME_DEVEL_SANDBOX so the zygote host finds it
+	// regardless of where the application binary lives, and the sandbox is
+	// switched on.
+	//
+	// The caller is responsible for only passing a path that exists with
+	// the right ownership: with the sandbox enabled and no usable helper —
+	// and user namespaces restricted, as on recent Debian/Ubuntu — Chromium
+	// aborts the whole process ("No usable sandbox!") rather than reporting
+	// an error, which is why enabling it is opt-in and pre-verified, never
+	// guessed.
+	SandboxPath string
 }
 
 // Initialize starts CEF's browser process.
@@ -183,7 +198,18 @@ func Initialize(cfg Config) error {
 	lf := C.CString(cfg.LogFile)
 	defer C.free(unsafe.Pointer(lf))
 
-	if C.gocef_initialize(res, loc, cache, rootCache, helper, sw, 60, lf) != 0 {
+	enableSandbox := C.int(0)
+	if cfg.SandboxPath != "" {
+		// The zygote host resolves the SUID helper from this variable before
+		// falling back to a path beside the application binary — which is not
+		// where a bellui payload keeps it.
+		if err := os.Setenv("CHROME_DEVEL_SANDBOX", cfg.SandboxPath); err != nil {
+			return fmt.Errorf("gocef: setting CHROME_DEVEL_SANDBOX: %w", err)
+		}
+		enableSandbox = 1
+	}
+
+	if C.gocef_initialize(res, loc, cache, rootCache, helper, sw, 60, lf, enableSandbox) != 0 {
 		return fmt.Errorf("gocef: %s", C.GoString(C.gocef_error()))
 	}
 	started = true
