@@ -594,11 +594,51 @@ int gocef_execute_process(int argc, char **argv) {
   return p_execute_process(&args, NULL, NULL);
 }
 
+// ---------------------------------------------------------------------------
+// External message pump (optional). Process-lifetime singletons with inert
+// refcounts — the phase-0 pattern, correct here because the app struct and
+// its browser-process handler live exactly as long as the process: CEF is
+// never shut down by design, so nothing ever frees them.
+
+static void CEF_CALLBACK pump_add_ref(cef_base_ref_counted_t *base) {
+  (void)base;
+}
+static int CEF_CALLBACK pump_release(cef_base_ref_counted_t *base) {
+  (void)base;
+  return 0;
+}
+static int CEF_CALLBACK pump_has_one(cef_base_ref_counted_t *base) {
+  (void)base;
+  return 1;
+}
+static int CEF_CALLBACK pump_has_any(cef_base_ref_counted_t *base) {
+  (void)base;
+  return 1;
+}
+
+static void CEF_CALLBACK bp_on_schedule_pump(
+    cef_browser_process_handler_t *self, int64_t delay_ms) {
+  (void)self;
+  // Fires from arbitrary CEF threads; the Go side only signals.
+  gocefOnScheduleMessagePumpWork(delay_ms);
+}
+
+static cef_browser_process_handler_t g_pump_bph;
+static cef_app_t g_pump_app;
+
+static cef_browser_process_handler_t *CEF_CALLBACK
+app_get_browser_process_handler(cef_app_t *self) {
+  (void)self;
+  // Inert refcounts make the usual "getter returns an owned reference" rule
+  // a no-op; returning the singleton is safe.
+  return &g_pump_bph;
+}
+
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
                      const char *cachePath, const char *rootCachePath,
                      const char *helperPath, const char *switches,
                      int windowlessFrameRate, const char *logFile,
-                     int enableSandbox) {
+                     int enableSandbox, int externalPump) {
   (void)windowlessFrameRate; // per-browser, applied in gocef_create_browser
 
   static char *argv[MAX_SWITCHES + 1];
@@ -648,7 +688,29 @@ int gocef_initialize(const char *resourcesDir, const char *localesDir,
          (rootCachePath != NULL && rootCachePath[0] != '\0') ? rootCachePath
                                                              : cachePath);
 
-  if (p_initialize(&args, &settings, NULL, NULL) != 1) {
+  cef_app_t *app = NULL;
+  if (externalPump) {
+    memset(&g_pump_bph, 0, sizeof(g_pump_bph));
+    g_pump_bph.base.size = sizeof(g_pump_bph);
+    g_pump_bph.base.add_ref = pump_add_ref;
+    g_pump_bph.base.release = pump_release;
+    g_pump_bph.base.has_one_ref = pump_has_one;
+    g_pump_bph.base.has_at_least_one_ref = pump_has_any;
+    g_pump_bph.on_schedule_message_pump_work = bp_on_schedule_pump;
+
+    memset(&g_pump_app, 0, sizeof(g_pump_app));
+    g_pump_app.base.size = sizeof(g_pump_app);
+    g_pump_app.base.add_ref = pump_add_ref;
+    g_pump_app.base.release = pump_release;
+    g_pump_app.base.has_one_ref = pump_has_one;
+    g_pump_app.base.has_at_least_one_ref = pump_has_any;
+    g_pump_app.get_browser_process_handler = app_get_browser_process_handler;
+
+    settings.external_message_pump = 1;
+    app = &g_pump_app;
+  }
+
+  if (p_initialize(&args, &settings, app, NULL) != 1) {
     snprintf(g_err, sizeof(g_err), "cef_initialize failed");
     return -1;
   }

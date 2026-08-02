@@ -82,3 +82,12 @@ jobs:
         env:
           GOCEF_PAYLOAD: /home/runner/cef-payload
         run: CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./...
+
+      # CEF is once-per-process, so the external-pump configuration
+      # (belluikit/bellui#120) runs as a second process; the env selects which
+      # of the two TestCEFRuntime* actually executes.
+      - name: Run against the payload (external message pump)
+        env:
+          GOCEF_PAYLOAD: /home/runner/cef-payload
+          GOCEF_EXTERNAL_PUMP: "1"
+        run: CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./...

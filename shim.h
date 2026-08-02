@@ -53,11 +53,15 @@ int gocef_load(const char *dir, int apiVersion);
 // enableSandbox selects Chromium's Linux sandbox; the caller must have
 // verified a usable SUID helper first (see Config.SandboxPath), because with
 // no usable sandbox Chromium aborts the process instead of failing the call.
+// externalPump, when non-zero, sets cef_settings_t.external_message_pump and
+// installs a process-lifetime cef_app_t whose browser-process handler forwards
+// on_schedule_message_pump_work to gocefOnScheduleMessagePumpWork. Zero keeps
+// today's NULL-app initialization byte for byte.
 int gocef_initialize(const char *resourcesDir, const char *localesDir,
                      const char *cachePath, const char *rootCachePath,
                      const char *helperPath, const char *switches,
                      int windowlessFrameRate, const char *logFile,
-                     int enableSandbox);
+                     int enableSandbox, int externalPump);
 
 // gocef_work runs one iteration of CEF's message loop. It must be called from
 // the same thread that called gocef_initialize — CEF's browser UI thread.
@@ -210,6 +214,14 @@ extern void gocefOnDevToolsMessage(uint64_t handle, void *msg, int n);
 // (bounds is morally const; cgo cannot export a const-qualified pointer.)
 extern void gocefOnImeCompositionRange(uint64_t handle, uint32_t from,
                                        uint32_t to, int *bounds, int n);
+
+// gocefOnScheduleMessagePumpWork asks for a gocef_work call after delay_ms:
+// <= 0 means reasonably soon, > 0 after the delay, REPLACING any pending
+// request — CEF's documented external-pump contract. Unlike every other
+// callback in this header it is process-scoped and fires FROM ANY THREAD;
+// the Go side must only signal its scheduler and return — no registry access,
+// no CEF calls.
+extern void gocefOnScheduleMessagePumpWork(int64_t delay_ms);
 
 // ---------------------------------------------------------------------------
 // Callbacks into Go. All are called on CEF's browser UI thread, which is the
