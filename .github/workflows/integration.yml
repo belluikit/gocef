@@ -33,11 +33,12 @@ jobs:
       # download and a 1.4 GB unpack. Keyed on the CEF version, so a pin bump
       # rebuilds it and nothing else does.
       #
-      # It is fetched from upstream rather than from belluikit/gocef-libs'
-      # release, which would be smaller and already stripped — but that repo is
-      # private, and this workflow's GITHUB_TOKEN is scoped to this repository
-      # only. Switching to it needs a cross-repo token in secrets; until then
-      # upstream is the option that needs no credentials.
+      # It is fetched from upstream (CEF's own builds) rather than from
+      # belluikit/gocef-libs' release, which would be smaller and already
+      # stripped. That choice dates from when gocef-libs was private and this
+      # workflow's GITHUB_TOKEN could not read it. With gocef-libs public its
+      # release needs no credentials either, so switching is now only a change
+      # to this step.
       - name: Cache the CEF payload
         id: payload
         uses: actions/cache@v4
