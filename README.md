@@ -132,18 +132,37 @@ reusable binding.
 
 Implemented: the runtime loader and version handshake, windowless browser
 lifecycle, resize, visibility, focus, the render callbacks (paint, accelerated
-paint, popup surface, cursor), HiDPI scale, mouse and keyboard input,
-navigation, and the DevTools bridge.
+paint, popup surface, cursor), HiDPI scale, mouse and keyboard input, IME
+composition, navigation and the load handler / navigation policy, the DevTools
+bridge, profile persistence (`CachePath`, `RootCachePath`), the external message
+pump (`Config.PumpScheduler`), and an opt-in Chromium sandbox
+(`Config.SandboxPath`).
 
-Not implemented: IME composition and touch (belluikit/bellui#121), and
-`external_message_pump` (belluikit/bellui#120).
+Not implemented: touch input (`send_touch_event`). No Linux touch device is a
+target yet, so it was recorded rather than planned in belluikit/bellui#121.
 
-**Nothing here has run.** The portable build is verified and CI compiles the
-Linux half, but no part of this has been exercised against a real CEF payload —
-including the 13300 API pin, which is reasoned from a survey of version guards
-where the probe only ever proved 15101. That is belluikit/bellui#117.
+**What has run.** The `Integration` workflow runs the binding against a real CEF
+151 payload (`CEF_VERSION` in `.github/workflows/integration.yml`) on every push,
+headless, in two processes because CEF initializes once per process: one with
+CEF's own message loop, one with the external message pump. It covers frames,
+profile on disk, resize, HiDPI, visibility, navigation, IME composition and two
+browsers at once. What it does not cover: the sandbox, accelerated (dma-buf)
+paint, which needs a GPU and a display, and the low end of the API pin. The
+13300 pin is exercised only against CEF 151; that older `libcef.so` builds
+accept it is still reasoned from the guard survey in `version.go`.
+
+## Contributing
+
+Issues and pull requests are welcome. Larger changes are usually discussed in a
+[bellui](https://github.com/belluikit/bellui) issue first, since that is where
+the web-view backend this binding serves is tracked.
 
 ## Licence
 
-The binding is ours. The vendored headers under `internal/cefapi/include` are
-CEF's, BSD-3-Clause — see `internal/cefapi/LICENSE.txt`.
+The binding is BSD-3-Clause, see [LICENSE](LICENSE).
+
+It is built on the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef)
+(CEF), copyright Marshall A. Greenblatt and portions Google Inc., under the
+BSD 3-Clause license. The vendored headers under `internal/cefapi/include` are
+CEF's; its license text is in
+[`internal/cefapi/LICENSE.txt`](internal/cefapi/LICENSE.txt).
