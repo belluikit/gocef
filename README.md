@@ -142,14 +142,15 @@ Not implemented: touch input (`send_touch_event`). No Linux touch device is a
 target yet, so it was recorded rather than planned in belluikit/bellui#121.
 
 **What has run.** The `Integration` workflow runs the binding against a real CEF
-151 payload (`CEF_VERSION` in `.github/workflows/integration.yml`) on every push,
+154 payload (`CEF_VERSION` in `.github/workflows/integration.yml`) on every push,
 headless, in two processes because CEF initializes once per process: one with
 CEF's own message loop, one with the external message pump. It covers frames,
 profile on disk, resize, HiDPI, visibility, navigation, IME composition and two
 browsers at once. What it does not cover: the sandbox, accelerated (dma-buf)
 paint, which needs a GPU and a display, and the low end of the API pin. The
-13300 pin is exercised only against CEF 151; that older `libcef.so` builds
-accept it is still reasoned from the guard survey in `version.go`.
+13300 pin has run against CEF 151 and 154, the latter with the headers still
+vendored from 151; that older `libcef.so` builds accept it is still reasoned
+from the guard survey in `version.go`.
 
 ## Contributing
 
