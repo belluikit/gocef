@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 env:
-  CEF_VERSION: "151.3.12+gd9cea67+chromium-151.0.7922.47"
+  CEF_VERSION: "154.0.34+g14c5a08+chromium-154.0.8037.98"
 
 jobs:
   runtime:
@@ -82,7 +82,13 @@ jobs:
       - name: Run against the payload
         env:
           GOCEF_PAYLOAD: /home/runner/cef-payload
-        run: CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./...
+        # A CEF subprocess that aborts does not fail the test: the browser
+        # process carries on, and only the subprocess's stderr says so. CEF 154
+        # killed zygote children with "stack smashing detected" while every
+        # check passed, so the run fails on that line itself.
+        run: |
+          CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./... 2>&1 | tee test.log
+          ! grep -n "stack smashing detected" test.log
 
       # CEF is once-per-process, so the external-pump configuration
       # (belluikit/bellui#120) runs as a second process; the env selects which
@@ -91,4 +97,6 @@ jobs:
         env:
           GOCEF_PAYLOAD: /home/runner/cef-payload
           GOCEF_EXTERNAL_PUMP: "1"
-        run: CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./...
+        run: |
+          CGO_ENABLED=1 go test -v -run TestCEFRuntime -timeout 15m ./... 2>&1 | tee test.log
+          ! grep -n "stack smashing detected" test.log

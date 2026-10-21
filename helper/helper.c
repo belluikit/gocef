@@ -34,7 +34,12 @@
 
 #include "include/capi/cef_app_capi.h"
 
-int main(int argc, char **argv) {
+// No stack protector on main. Chromium's zygote forks this process's children
+// and, from CEF 154 on, those children evidently get a fresh stack canary:
+// main's frame still holds the zygote's, so a child that exits by returning
+// through here failed the check ("*** stack smashing detected ***") on every
+// normal exit (belluikit/bellui#510). Nothing past this frame is ours.
+__attribute__((no_stack_protector)) int main(int argc, char **argv) {
   char exe[1024];
   ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
   if (n < 0) {
